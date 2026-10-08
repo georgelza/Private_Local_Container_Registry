@@ -1,0 +1,191 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  THE PULL TEST — the one manifest this extract needs
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  This is the ONLY file here that is not extracted from the source. It is here
+#  because the source has no standalone pull test: its manifests
+#  (k8s/core1/4.04.users.deployment-service.yaml and friends) are the real
+#  core-* services, and each one requires a ServiceAccount, a ConfigMap, a
+#  Vault Secret and a whole configuration surface before it can do anything.
+#  That is the wrong shape for isolating "can a node pull an image from the
+#  registry over our self-signed TLS".
+#
+#  nginx:alpine has no dependencies, no configuration and no secrets. If this
+#  pod reaches Running, the registry, the CA, the containerd trust store and
+#  the image reference are all proven in one step.
+#
+#  ── THE TWO LINES THAT ARE THE SUBJECT ──────────────────────────────────────
+#
+#      image: host.docker.internal:5001/regis-nginx:alpine
+#      imagePullPolicy: Always
+#
+#  Both are copied from the source's real manifest, unmodified in form:
+#      k8s/core1/4.04.users.deployment-service.yaml
+#          image: host.docker.internal:5001/core-users:0.6
+#          imagePullPolicy: Always
+#
+#  Two properties of that image reference carry the whole mechanism:
+#
+#  1. host.docker.internal, NOT localhost. The kubelet runs inside a vcluster
+#     node container, so `localhost` there is the node itself, which has no
+#     registry on 5001. host.docker.internal is Docker's embedded DNS name for
+#     the VM gateway. This is the same name the cert SAN and the containerd
+#     certs.d directory are keyed on:
+#         SAN            DNS.3 = host.docker.internal
+#         certs.d dir    /etc/containerd/certs.d/host.docker.internal:5001
+#         hosts.toml     server = "https://host.docker.internal:5001"
+#     Change the port in any one of those and the others must change with it.
+#
+#  2. imagePullPolicy: Always, which is deliberate and load-bearing. The
+#     default is IfNotPresent, and after a successful earlier pull the image is
+#     already in the node's containerd — so IfNotPresent would satisfy the pull
+#     from local cache, the registry would never be contacted, and the CA
+#     injection would go completely untested while the pod still started green.
+#     Always forces a registry round-trip on every pod start, which is the only
+#     way the test measures what it claims to measure.
+#
+#  ── A NOTE ON TRUST, because this is a SELF-SIGNED registry ────────────────
+#
+#  A pull succeeds only if BOTH of these hold:
+#
+#     (a) the CA that signed the registry's certificate is in the trust store
+#         the node's containerd actually consults, AND
+#     (b) the hostname the kubelet dials (host.docker.internal) appears in that
+#         certificate's subjectAltName.
+#
+#  (a) is what scripts/containerd-hosts.toml + the `make k8s` step-[2/10] loop
+#  establish. (b) is what `DNS.3 = host.docker.internal` in the `certs` target
+#  establishes. Failing (a) gives:
+#     x509: certificate signed by unknown authority
+#  Failing (b) gives:
+#     x509: certificate is valid for localhost, not host.docker.internal
+#  Those two messages are the primary diagnostic this test exists to produce.
+#
+#  NOTE that scripts/containerd-hosts.toml sets `skip_verify = true`. That
+#  means (a) is NOT actually enforced during the handshake — see README
+#  finding #4. So a successful pull proves (b) and connectivity, but does not
+#  by itself prove the CA is correct. `make verify-nodes` and `make preflight`
+#  are what check the CA.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: regis-pull
+  labels:
+    core.lab/simulation: "true"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: regis-pull
+  labels:
+    app: nginx
+    core.lab/simulation: "true"
+spec:
+  # 1 replica. The question is "can a node pull this", not "can the scheduler
+  # spread it", and a single pod keeps the evidence unambiguous: one node, one
+  # pull, one log to read.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  strategy:
+    # Recreate, not RollingUpdate — with 1 replica and no Service there is
+    # nothing to roll, and Recreate gives one clean start rather than a surge.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: nginx
+        core.lab/simulation: "true"
+    spec:
+      # Deliberately NO nodeSelector. The real question is whether EVERY node
+      # can pull, and pinning to one worker would hide a partially-patched
+      # cluster. `make verify-nodes` checks all four; this checks that the
+      # scheduler's chosen node can pull.
+      containers:
+        - name: nginx
+          # ↓↓↓ THE LINE UNDER TEST ↓↓↓
+          image: host.docker.internal:5001/regis-nginx:alpine
+          # ↑↑↑ rewritten from .env by make deploy-nginx ↑↑↑
+
+          # See point 2 in the header. Required for the test to mean anything.
+          imagePullPolicy: Always
+
+          env:
+            # Downward API, so the pod log names the node that actually pulled
+            # the image. That is the per-node evidence: if two different nodes
+            # can be made to run this, both are proven.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+          ports:
+            - name: http
+              containerPort: 80
+
+          # A Running nginx is the assertion. Without a probe, "Running" only
+          # means the container started, which is already the proof we want
+          # here — but a probe makes the pod genuinely Ready, which makes
+          # `kubectl get pods` a one-glance answer instead of a judgement call.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 20
+
+          # Generous, because a first pull fetches every layer over TLS from a
+          # self-signed registry. Too short and the pod is killed mid-pull,
+          # which looks like an image problem and is not one.
+          #
+          # NOTE: terminationGracePeriodSeconds is a PodSpec field, not a
+          # container field — placed inside `containers[]` the API server
+          # rejects the whole manifest with a strict-decoding error naming the
+          # misplaced path. Set at pod level below.
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+
+          # NO securityContext hardening here, deliberately.
+          #
+          # nginx:alpine's master process binds :80, and binding a privileged
+          # port requires CAP_NET_BIND_SERVICE. An earlier draft of this file
+          # set `capabilities: {drop: [ALL]}` and `runAsNonRoot`, which is the
+          # correct hardening for a real workload and an immediate
+          # containerdCrashLoopBackOff here — the image would pull perfectly
+          # and then die, and the failure would read as a registry problem.
+          #
+          # For the same reason there is no runAsUser: nginx:alpine's entrypoint
+          # writes to /var/cache/nginx and /etc/nginx as root.
+          #
+          # The subject of this manifest is the PULL, not the security posture.
+          # If you want a hardened variant, the image has to change too — e.g.
+          # an unprivileged base, or an nginx.conf listening on 8080 — because
+          # hardening the pod while keeping a :80-binding image cannot work.
+
+      # Generous shutdown budget, at PodSpec level (see note above).
+      terminationGracePeriodSeconds: 30

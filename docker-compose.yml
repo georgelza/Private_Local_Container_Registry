@@ -1,0 +1,101 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXTRACT — READ THIS FIRST
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  This file is an EXTRACTION of
+#     CORE_Banking/deploy/docker-compose.yml
+#  not a rewrite of it. Everything from `name: corebanking` onwards that is
+#  needed to run the LOCAL TLS REGISTRY is byte-for-byte identical to the
+#  source, including its comments, its healthcheck, and its fixed
+#  container_name / hostname literals. Verify with:
+#
+#     ./verify-extract.sh
+#
+#  WHAT WAS REMOVED (the point of the exercise — the rest of the supporting
+#  stack is not needed to deploy a registry, mint certs, and have a vcluster
+#  pull from it):
+#
+#     core_broker, core_connect, core_kcat, core_filebeat, core_rustfs,
+#     core_postgres, core_repmgrd_primary, core_pgbouncer
+#     the `configs:` block (pg_conf, pg_hba) — postgres-only
+#
+#  NOTHING ELSE WAS TOUCHED. In particular the following are reproduced exactly
+#  as the source has them, because they are the subject of the root-cause
+#  investigation and "fixing" them here would destroy the reproduction:
+#
+#     • `name: corebanking` and `container_name: regis-registry` — the source's
+#       own resource names. This extract therefore CANNOT run at the same time
+#       as the source stack; that collision is itself finding #6 in README.md.
+#     • the healthcheck invoking `curl` — registry:2 has no curl (finding #1).
+#     • `depends_on: condition: service_started` (finding #2).
+#
+#  The header comment below is the SOURCE's, kept verbatim. Several of its
+#  statements are no longer true of this reduced file (it lists services that
+#  were removed); they are left as-is so the diff against the source stays
+#  clean, and are annotated where they matter in README.md.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: regis
+services:
+  # ══════════════════════════════════════════════════════════════════════════
+  # CONTAINER REGISTRY (local — ADR-56)
+  # vcluster kubelets pull core app images from here via host.docker.internal:5001
+  # (node containers resolve the Docker Desktop host). Blobs live in
+  # ./data/registry — wiped by `make down`. registry:2 is scratch-based (no
+  # shell inside), so `make run` probes TCP 5000 from the host instead of using
+  # a container healthcheck.
+  # ══════════════════════════════════════════════════════════════════════════
+  regis_registry:
+    image: ${REGISTRY_IMAGE:-registry:2}
+    container_name: regis-registry
+    hostname: regis-registry
+    ports:
+      - ${HOST_PORT_REGISTRY:-5001}:5000
+    volumes:
+      - ./data/registry:/var/lib/registry
+      - ./data/registry/certs:/certs:ro
+    environment:
+      # registry:2 refuses DELETE /v2/<name>/manifests/<digest> (501) without this �M-^@M-^T
+      # required for the UI's delete controls and deploy/scripts/purge_registry.sh.
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      # TLS configuration (ADR-56)
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/server.crt
+      REGISTRY_HTTP_TLS_KEY: /certs/server.key
+    healthcheck:
+      # wget, NOT curl: the registry:2 image ships no curl (only busybox wget), so a
+      # curl probe fails 127 -> "|| exit 1" -> Docker marks the container unhealthy
+      # while the registry is serving 200 perfectly well. Confirmed 26 Sep 2026.
+      # --no-check-certificate is required: the registry serves HTTPS using the local
+      # self-signed CA from ./data/registry/certs.
+      test: ["CMD-SHELL", "wget --no-check-certificate -q -O /dev/null https://localhost:5000/v2/_catalog || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  regis_registry_ui:
+    image: ${REGISTRY_UI_IMAGE:-joxit/docker-registry-ui:latest} 
+    container_name: regis-registry-ui
+    hostname: regis-registry-ui
+    depends_on:
+      regis_registry:
+        condition: service_started
+    ports:
+      - ${HOST_PORT_REGISTRY_UI:-8080}:80
+    environment:
+      # Same-origin proxy: the UI container's nginx proxies /v2/* to the
+      # registry, so the browser talks to this one origin only (no CORS).
+      # Registry now uses TLS (ADR-56) — internal proxy must use HTTPS and skip verify
+      NGINX_PROXY_PASS_URL: https://regis-registry:5000
+      NGINX_PROXY_SSL_VERIFY: "off"
+      # Baked into index.html as the registry-url attribute — must be a URL
+      # the BROWSER can reach (this UI's own origin), not the container DNS.
+      REGISTRY_URL: http://localhost:${HOST_PORT_REGISTRY_UI:-8080}
+      SINGLE_REGISTRY: "true"
+      # Enables the per-tag + multi-select delete controls in the UI.
+      DELETE_IMAGES: "true"
+
+networks:
+  default:
+    name: regis

@@ -1,0 +1,48 @@
+# https://github.com/loft-sh/vind/blob/main/docs/configuration.md
+
+# The Below is part of the Enterprise license
+# To deploy with the below included execute with --add=false, otherwise leave commented out.
+# sudo vcluster create my-core1 --values vcluster1.yml --add=false
+#
+# controlPlane:
+  # Configure the backing store for vCluster's data
+  # backingStore: # Enterprise feature - requires license
+  #   etcd:
+  #     embedded: 
+  #       enabled: true  # Run etcd inside the vCluster pod
+
+experimental:
+  docker:
+    nodes:
+    - name: "worker-1"
+      volumes:
+        - "./data/core1/n1:/data"
+      env:
+        - "NODE_ROLE=worker"
+    - name: "worker-2"
+      volumes:
+        - "./data/core1/n2:/data"
+      env:
+        - "NODE_ROLE=worker"
+    - name: "worker-3"
+      volumes:
+        - "./data/core1/n3:/data"
+      env:
+        - "NODE_ROLE=worker"
+    # - name: "worker-4"
+    #   volumes:
+    #     - "./data/core1/n4:/data"
+    #   env:
+    #     - "NODE_ROLE=worker"
+
+# Create the cluster with: (using sudo allows for load balancer services)
+# sudo vcluster create my-core1 -f vcluster1.yml
+
+# Tear down the cluster with:
+# vcluster delete my-core1
+
+# Pause the cluster with:
+# vcluster pause my-core1
+
+# Resume the cluster with:
+# vcluster resume my-core1
