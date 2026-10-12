@@ -26,7 +26,7 @@
 
     <rect x="60" y="250" width="430" height="40" rx="6" fill="#0f172a" stroke="#334155" />
     <text x="80" y="275" fill="#34d399">scripts/patch_nodes_ca.sh</text>
-    <text x="260" y="275" fill="#94a3b8">(Asserts &amp; exits non-zero)</text>
+    <text x="278" y="275" fill="#94a3b8">(Asserts &amp; exits non-zero)</text>
 
     <rect x="510" y="100" width="390" height="40" rx="6" fill="#0f172a" stroke="#334155" />
     <text x="530" y="125" fill="#38bdf8">scripts/containerd-hosts.toml.tmpl</text>
