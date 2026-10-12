@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 584" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg7c" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#1e1b4b" />
+    </linearGradient>
+  </defs>
+
+  <rect width="960" height="584" fill="url(#bg7c)" rx="16" />
+
+  <text x="480" y="34" fill="#e2e8f0" font-family="sans-serif" font-size="17" font-weight="bold" text-anchor="middle">The third trust store, which turned out not to exist</text>
+  <text x="480" y="54" fill="#94a3b8" font-family="sans-serif" font-size="11" text-anchor="middle">measured, with the daemon CA files deleted — same endpoint, same moment</text>
+
+  <!-- premise -->
+  <rect x="40" y="72" width="880" height="56" rx="8" fill="#1e293b" stroke="#6366f1" stroke-width="1.5" />
+  <text x="60" y="96" fill="#a5b4fc" font-family="sans-serif" font-size="13" font-weight="bold">The assumption we started with</text>
+  <text x="60" y="118" fill="#94a3b8" font-family="sans-serif" font-size="11">"curl --cacert and the docker daemon are separate trust paths, so the daemon must need the CA installed."</text>
+
+  <!-- docker info -->
+  <rect x="40" y="146" width="430" height="128" rx="8" fill="#0f172a" stroke="#0284c7" />
+  <text x="60" y="172" fill="#38bdf8" font-family="sans-serif" font-size="13" font-weight="bold">docker info</text>
+  <text x="60" y="198" fill="#94a3b8" font-family="monospace" font-size="11">Insecure Registries:</text>
+  <text x="76" y="218" fill="#94a3b8" font-family="monospace" font-size="11">hubproxy.docker.internal:5555</text>
+  <rect x="60" y="228" width="150" height="24" rx="4" fill="#78350f" />
+  <text x="135" y="245" fill="#fcd34d" font-family="monospace" font-size="11" text-anchor="middle">127.0.0.0/8</text>
+  <rect x="220" y="228" width="120" height="24" rx="4" fill="#78350f" />
+  <text x="280" y="245" fill="#fcd34d" font-family="monospace" font-size="11" text-anchor="middle">::1/128</text>
+  <text x="60" y="266" fill="#fbbf24" font-family="sans-serif" font-size="11" font-weight="bold">loopback is exempt from verification</text>
+
+  <!-- result: localhost -->
+  <rect x="490" y="146" width="430" height="128" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="2" />
+  <text x="510" y="172" fill="#34d399" font-family="sans-serif" font-size="13" font-weight="bold">PUSH → localhost:5001  (loopback)</text>
+  <text x="510" y="198" fill="#a7f3d0" font-family="monospace" font-size="10">docker push localhost:5001/probe-a:latest</text>
+  <rect x="510" y="210" width="150" height="26" rx="4" fill="#059669" />
+  <text x="585" y="228" fill="#ffffff" font-family="sans-serif" font-size="11" font-weight="bold" text-anchor="middle">→ succeeded</text>
+  <text x="510" y="258" fill="#6ee7b7" font-family="sans-serif" font-size="11" font-weight="bold">no CA installed, and none needed</text>
+
+  <!-- control: curl -->
+  <rect x="490" y="286" width="430" height="86" rx="8" fill="#450a0a" stroke="#dc2626" stroke-width="2" />
+  <text x="510" y="312" fill="#fca5a5" font-family="sans-serif" font-size="13" font-weight="bold">CURL → the same endpoint</text>
+  <text x="510" y="336" fill="#fecaca" font-family="monospace" font-size="10">curl https://localhost:5001/v2/_catalog</text>
+  <text x="510" y="360" fill="#f87171" font-family="monospace" font-size="10">curl: (60) SSL certificate problem</text>
+
+  <!-- result: gateway -->
+  <rect x="40" y="286" width="430" height="86" rx="8" fill="#450a0a" stroke="#dc2626" stroke-width="2" />
+  <text x="60" y="312" fill="#fca5a5" font-family="sans-serif" font-size="13" font-weight="bold">PUSH → host.docker.internal:5001</text>
+  <text x="60" y="336" fill="#fecaca" font-family="monospace" font-size="10">docker push host.docker.internal:5001/probe-b</text>
+  <text x="60" y="360" fill="#f87171" font-family="monospace" font-size="10">x509: certificate signed by unknown authority</text>
+
+  <!-- the asymmetry -->
+<rect x="40" y="386" width="880" height="108" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="2" />
+  <text x="60" y="412" fill="#fbbf24" font-family="sans-serif" font-size="14" font-weight="bold">The asymmetry that matters</text>
+  <text x="60" y="436" fill="#e0e7ff" font-family="sans-serif" font-size="12">One client verified, the other did not — on the identical URL, in the same second. The push can go</text>
+  <text x="60" y="456" fill="#e0e7ff" font-family="sans-serif" font-size="12">unverified and nobody notices. The pull never can: containerd has no loopback exemption, and it dials</text>
+  <text x="60" y="476" fill="#94a3b8" font-family="sans-serif" font-size="11">the gateway name regardless. Every trust failure in this lab has been upstream of the image pull.</text>
+
+<rect x="40" y="508" width="880" height="60" rx="6" fill="#0f172a" stroke="#475569" />
+  <text x="60" y="530" fill="#94a3b8" font-family="sans-serif" font-size="11">The exemption is loopback-SPECIFIC. Pushing via the gateway does verify — and still failed even with the CA</text>
+  <text x="60" y="550" fill="#94a3b8" font-family="sans-serif" font-size="11">correctly installed, because Docker Desktop does not read ~/.docker/certs.d until it is restarted.</text>
+</svg>

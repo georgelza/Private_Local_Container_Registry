@@ -1,48 +1,34 @@
-# https://github.com/loft-sh/vind/blob/main/docs/configuration.md
-
-# The Below is part of the Enterprise license
-# To deploy with the below included execute with --add=false, otherwise leave commented out.
-# sudo vcluster create my-core1 --values vcluster1.yml --add=false
+# vCluster topology for the local lab.
 #
-# controlPlane:
-  # Configure the backing store for vCluster's data
-  # backingStore: # Enterprise feature - requires license
-  #   etcd:
-  #     embedded: 
-  #       enabled: true  # Run etcd inside the vCluster pod
+# One vCluster, four node containers: a control plane plus three workers.
+# Each worker bind-mounts ./data/cluster/n<N> -> /data, which is where the
+# node's own state lands (this is what `make k8s-down` deletes).
+#
+# The docker driver is what makes this lab work: it gives us a vCluster node as
+# a real Docker container with a real containerd inside it, which is the only
+# reason the CA can be injected at all. See README.md §3.
+#
+#   vcluster create my-regis1 -f vcluster1.yml
+#   vcluster delete my-regis1
+#
+# Note: the control plane is created by `vcluster create` itself, before this
+# file is read — it is not listed here.
 
 experimental:
   docker:
     nodes:
     - name: "worker-1"
       volumes:
-        - "./data/core1/n1:/data"
+        - "./data/cluster/n1:/data"
       env:
         - "NODE_ROLE=worker"
     - name: "worker-2"
       volumes:
-        - "./data/core1/n2:/data"
+        - "./data/cluster/n2:/data"
       env:
         - "NODE_ROLE=worker"
     - name: "worker-3"
       volumes:
-        - "./data/core1/n3:/data"
+        - "./data/cluster/n3:/data"
       env:
         - "NODE_ROLE=worker"
-    # - name: "worker-4"
-    #   volumes:
-    #     - "./data/core1/n4:/data"
-    #   env:
-    #     - "NODE_ROLE=worker"
-
-# Create the cluster with: (using sudo allows for load balancer services)
-# sudo vcluster create my-core1 -f vcluster1.yml
-
-# Tear down the cluster with:
-# vcluster delete my-core1
-
-# Pause the cluster with:
-# vcluster pause my-core1
-
-# Resume the cluster with:
-# vcluster resume my-core1

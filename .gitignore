@@ -10,10 +10,5 @@
 # reproduce a real image pull. ~245 MB of image blobs.
 data/
 
-# Secret material. Present in the source (k8s/conf/keys.conf) and copied here
-# only so the source's `make vault-secret` recipe runs unmodified. It holds the
-# Vault root token.
-k8s/conf/keys.conf
 
-# The vcluster node volumes are bind-mounted from ./data/core1/n{1,2,3} by
-# vcluster1.yml, so they are already covered by data/ above.
+old/

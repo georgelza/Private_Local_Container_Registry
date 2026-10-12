@@ -1,48 +1,49 @@
 #!/usr/bin/env bash
 #
-# recover_registry_ca.sh — restore the local registry CA certificate.
+# recover_registry_ca.sh — restore the registry CA onto the host.
 #
 # WHY THIS EXISTS
-#   deploy/data/registry/certs/ is generated, not source-controlled: `make run`
-#   regenerates ca.crt/ca.key/server.crt/server.key on every stack bring-up
-#   (short-lived by design). If that directory is ever emptied while the
-#   registry container keeps running, every `make build` fails at the
-#   TLS preflight, and the CA PRIVATE KEY is unrecoverable — so the certs
-#   cannot simply be regenerated to match the live server certificate.
+#   ./data/registry/certs/ is generated, not checked in. `make run` mints a fresh
+#   ca.crt/ca.key/server.crt/server.key on every bring-up. If that directory is
+#   emptied while the registry container keeps running, every TLS check fails —
+#   and the CA PRIVATE KEY is gone, so the certs cannot simply be reissued to
+#   match the certificate the live registry is still serving.
 #
-#   The nodes still hold the CA: each vcluster worker has it at
-#   /etc/containerd/certs.d/host.docker.internal:5001/ca.crt, because the
-#   registry is pulled from host.docker.internal. Copying it back is therefore
-#   the correct repair — and it is verifiable, which regeneration is not.
+#   The nodes still hold the CA: every one keeps it at
+#       /etc/containerd/certs.d/host.docker.internal:<port>/ca.crt
+#   because that is where the registry is pulled from. Copying it back out is
+#   therefore the correct repair — and unlike regeneration it is VERIFIABLE.
+#
+#   In this lab the honest answer is usually simpler: `make down` and `make k8s`
+#   rebuild the whole chain from scratch. This script exists for when you want
+#   to recover the CA without destroying a cluster you have already set up.
 #
 # USAGE
-#   deploy/scripts/recover_registry_ca.sh [node-container ...]
+#   scripts/recover_registry_ca.sh [node-container ...]
 #
-#   Defaults to every `vcluster.node.*` container. Override REGISTRY_HOST to
-#   match a non-default registry port.
+#   Defaults to every running vcluster node container.
+#   Override REGISTRY_HOST if your .env uses a non-default port.
 #
 # EXIT CODES
 #   0  CA recovered and verified against the live registry
 #   1  no source found, or the recovered CA does not validate the endpoint
 #
-# License:
-#   See <project root>/License.md
+# macOS ships bash 3.2: no mapfile.
 
 set -euo pipefail
 
-DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CERTS_DIR="$DEPLOY_DIR/data/registry/certs"
-CA_PATH_IN_CONTAINER="/etc/containerd/certs.d/host.docker.internal:${REGISTRY_HOST:-5001}/ca.crt"
-REGISTRY_URL="${REGISTRY_SCHEME:-https}://localhost:${REGISTRY_HOST:-5001}"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CERTS_DIR="$PROJECT_DIR/data/registry/certs"
+CA_PATH_IN_CONTAINER="/etc/containerd/certs.d/host.docker.internal:${REGISTRY_HOST:-$(grep -E '^HOST_PORT_REGISTRY=' "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2)}/ca.crt"
+REGISTRY_URL="${REGISTRY_SCHEME:-https}://localhost:${REGISTRY_HOST:-$(grep -E '^HOST_PORT_REGISTRY=' "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2)}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # Collect candidate source containers: explicit args, else every vcluster node.
-# NOTE: no mapfile — macOS ships bash 3.2, where it does not exist.
 if [ "$#" -gt 0 ]; then
     NODES="$*"
 else
-    NODES="$(docker ps --format '{{.Names}}' | grep -E '^vcluster\.node\.' || true)"
+    NODES="$(docker ps --format '{{.Names}}' | grep -E '^vcluster\.(node|cp)\.' || true)"
 fi
 [ -n "$NODES" ] || die "no vcluster node containers found — pass a container name explicitly"
 
@@ -63,13 +64,13 @@ for node in $NODES; do
         if curl -fsS --cacert "$CERTS_DIR/ca.crt" "$REGISTRY_URL/v2/_catalog" >/dev/null 2>&1; then
             echo "✅ verified: the recovered CA validates $REGISTRY_URL"
             echo
-            echo "NOTE: ca.key is NOT recoverable. Do not run 'make certs' expecting it to"
-            echo "      reissue a matching server cert — that would rotate the CA out from"
-            echo "      under the running nodes. A full 'make run' regenerates BOTH sides"
-            echo "      consistently and re-copies the CA to every node."
+            echo "NOTE: ca.key is NOT recoverable from a node — nodes hold only the public"
+            echo "      ca.crt. Do not run 'make certs' expecting it to reissue a matching"
+            echo "      server cert; that rotates the CA out from under the running nodes."
+            echo "      To rebuild the whole chain instead:  make clean && make run"
             exit 0
         fi
-        die "recovered CA does NOT validate $REGISTRY_URL — the registry is serving a different cert; run 'make run' for a consistent regeneration"
+        die "recovered CA does NOT validate $REGISTRY_URL — the registry is serving a different cert; run 'make clean && make run' for a consistent rebuild"
     fi
     rm -f "$tmp"
 done

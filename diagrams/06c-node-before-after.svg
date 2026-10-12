@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg6c" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#1e1b4b" />
+    </linearGradient>
+    <marker id="arrow6c" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#f59e0b" />
+    </marker>
+  </defs>
+
+  <rect width="960" height="560" fill="url(#bg6c)" rx="16" />
+
+  <text x="480" y="34" fill="#e2e8f0" font-family="sans-serif" font-size="17" font-weight="bold" text-anchor="middle">Before and after, inside a node</text>
+  <text x="480" y="54" fill="#94a3b8" font-family="sans-serif" font-size="11" text-anchor="middle">what patch_nodes_ca.sh writes, and why the bottom row is the one that matters</text>
+
+  <!-- BEFORE -->
+  <rect x="40" y="76" width="410" height="440" rx="10" fill="#1e293b" stroke="#64748b" stroke-width="2" />
+  <text x="60" y="104" fill="#94a3b8" font-family="sans-serif" font-size="15" font-weight="bold">BEFORE</text>
+
+  <rect x="60" y="120" width="370" height="150" rx="8" fill="#0f172a" stroke="#475569" />
+  <text x="80" y="146" fill="#e2e8f0" font-family="monospace" font-size="12">/etc/containerd/</text>
+  <text x="96" y="170" fill="#94a3b8" font-family="monospace" font-size="11">config.toml</text>
+  <rect x="112" y="182" width="240" height="26" rx="4" fill="#450a0a" stroke="#7f1d1d" />
+  <text x="232" y="200" fill="#fca5a5" font-family="monospace" font-size="11" text-anchor="middle">config_path = ""</text>
+  <text x="360" y="200" fill="#f87171" font-family="sans-serif" font-size="10">never read</text>
+  <text x="96" y="234" fill="#475569" font-family="monospace" font-size="11">certs.d/  — absent</text>
+  <text x="96" y="256" fill="#475569" font-family="monospace" font-size="11">hosts.toml — absent</text>
+
+  <rect x="60" y="286" width="370" height="96" rx="8" fill="#0f172a" stroke="#475569" />
+  <text x="80" y="312" fill="#e2e8f0" font-family="monospace" font-size="11">/usr/local/share/ca-certificates/</text>
+  <text x="96" y="340" fill="#475569" font-family="sans-serif" font-size="12">(nothing)</text>
+  <text x="96" y="364" fill="#64748b" font-family="sans-serif" font-size="11">system roots: no trace of our CA</text>
+
+  <rect x="60" y="398" width="370" height="98" rx="8" fill="#450a0a" stroke="#7f1d1d" />
+  <text x="80" y="424" fill="#fca5a5" font-family="sans-serif" font-size="12" font-weight="bold">Consequence</text>
+  <text x="80" y="448" fill="#fecaca" font-family="monospace" font-size="11">x509: certificate signed by</text>
+  <text x="80" y="466" fill="#fecaca" font-family="monospace" font-size="11">unknown authority</text>
+  <text x="80" y="486" fill="#94a3b8" font-family="sans-serif" font-size="11">the node cannot verify the registry</text>
+
+  <!-- arrow -->
+  <line x1="462" y1="296" x2="498" y2="296" stroke="#f59e0b" stroke-width="3" marker-end="url(#arrow6c)" />
+  <text x="480" y="284" fill="#fbbf24" font-family="sans-serif" font-size="10" font-weight="bold" text-anchor="middle">make k8s</text>
+
+  <!-- AFTER -->
+  <rect x="510" y="76" width="410" height="440" rx="10" fill="#1e293b" stroke="#10b981" stroke-width="2" />
+  <text x="530" y="104" fill="#34d399" font-family="sans-serif" font-size="15" font-weight="bold">AFTER</text>
+
+  <rect x="530" y="120" width="370" height="150" rx="8" fill="#0f172a" stroke="#059669" />
+  <text x="550" y="146" fill="#e2e8f0" font-family="monospace" font-size="12">/etc/containerd/</text>
+  <text x="566" y="170" fill="#a7f3d0" font-family="monospace" font-size="11">config.toml</text>
+  <rect x="582" y="182" width="300" height="26" rx="4" fill="#064e3b" stroke="#059669" />
+  <text x="732" y="200" fill="#a7f3d0" font-family="monospace" font-size="11" text-anchor="middle">config_path = "/etc/containerd/certs.d"</text>
+  <text x="582" y="230" fill="#34d399" font-family="monospace" font-size="11">certs.d/host.docker.internal:5001/</text>
+  <text x="600" y="248" fill="#a7f3d0" font-family="monospace" font-size="11">├─ ca.crt</text>
+  <text x="600" y="264" fill="#a7f3d0" font-family="monospace" font-size="11">└─ hosts.toml</text>
+
+  <rect x="530" y="286" width="370" height="96" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="2" />
+  <text x="550" y="312" fill="#e2e8f0" font-family="monospace" font-size="11">/usr/local/share/ca-certificates/</text>
+  <text x="566" y="338" fill="#a7f3d0" font-family="monospace" font-size="11">registry-ca.crt</text>
+  <rect x="700" y="320" width="186" height="24" rx="4" fill="#059669" />
+  <text x="793" y="337" fill="#ffffff" font-family="sans-serif" font-size="10" font-weight="bold" text-anchor="middle">← the one that works</text>
+  <text x="566" y="366" fill="#6ee7b7" font-family="sans-serif" font-size="11">this is what containerd actually consults</text>
+
+  <rect x="530" y="398" width="370" height="98" rx="8" fill="#064e3b" stroke="#059669" />
+  <text x="550" y="424" fill="#6ee7b7" font-family="sans-serif" font-size="12" font-weight="bold">Consequence</text>
+  <text x="550" y="450" fill="#a7f3d0" font-family="monospace" font-size="11">Verify return code: 0 (ok)</text>
+  <text x="550" y="472" fill="#94a3b8" font-family="sans-serif" font-size="11">a verified handshake — asserted, not assumed</text>
+
+  <text x="480" y="540" fill="#fcd34d" font-family="sans-serif" font-size="12" font-weight="bold" text-anchor="middle">With skip_verify = false and only certs.d populated, the bottom row is missing — and every pull fails.</text>
+</svg>

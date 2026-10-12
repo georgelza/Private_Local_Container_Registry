@@ -1,0 +1,6 @@
+server = "https://__REGISTRY_AUTHORITY__"
+
+[host."https://__REGISTRY_AUTHORITY__"]
+  capabilities = ["pull", "resolve"]
+  ca_file = "__CERTSD_IN_NODE__/ca.crt"
+  skip_verify = false

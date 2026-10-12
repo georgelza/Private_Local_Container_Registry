@@ -1,81 +1,57 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  THE PULL TEST — the one manifest this extract needs
-# ══════════════════════════════════════════════════════════════════════════════
+#  THE PULL TEST
 #
-#  This is the ONLY file here that is not extracted from the source. It is here
-#  because the source has no standalone pull test: its manifests
-#  (k8s/core1/4.04.users.deployment-service.yaml and friends) are the real
-#  core-* services, and each one requires a ServiceAccount, a ConfigMap, a
-#  Vault Secret and a whole configuration surface before it can do anything.
-#  That is the wrong shape for isolating "can a node pull an image from the
-#  registry over our self-signed TLS".
+#  The one manifest this lab needs. nginx:alpine has no dependencies, no config
+#  and no secrets, so if this pod reaches Running then the registry, the CA, the
+#  node's containerd trust store and the image reference are all proven in a
+#  single step. Nothing else is on the causal path.
 #
-#  nginx:alpine has no dependencies, no configuration and no secrets. If this
-#  pod reaches Running, the registry, the CA, the containerd trust store and
-#  the image reference are all proven in one step.
-#
-#  ── THE TWO LINES THAT ARE THE SUBJECT ──────────────────────────────────────
+#  ── THE TWO LINES UNDER TEST ────────────────────────────────────────────────
 #
 #      image: host.docker.internal:5001/regis-nginx:alpine
 #      imagePullPolicy: Always
 #
-#  Both are copied from the source's real manifest, unmodified in form:
-#      k8s/core1/4.04.users.deployment-service.yaml
-#          image: host.docker.internal:5001/core-users:0.6
-#          imagePullPolicy: Always
+#  1. host.docker.internal, NOT localhost. The kubelet runs inside a node
+#     container, so "localhost" there is the NODE ITSELF — nothing is listening
+#     on that port in there. host.docker.internal is Docker's embedded DNS name
+#     for the VM gateway, and the host's published port lands back on this
+#     registry. The same name keys the certificate SAN, the certs.d directory
+#     and hosts.toml:
+#         SAN          DNS.3 = host.docker.internal
+#         certs.d dir  /etc/containerd/certs.d/host.docker.internal:5001
+#         hosts.toml   server = "https://host.docker.internal:5001"
+#     All four are rendered from REGISTRY_AUTHORITY in the Makefile, so they
+#     cannot disagree — which is the only reason this works.
 #
-#  Two properties of that image reference carry the whole mechanism:
+#  2. imagePullPolicy: Always is load-bearing, not decoration. The default is
+#     IfNotPresent, and after one successful pull the image is already in the
+#     node's containerd — so IfNotPresent would satisfy the pull from local
+#     cache, the registry would never be contacted, the CA injection would go
+#     completely untested, and the pod would still start green. Always forces a
+#     round-trip every time, which is the only way this measures what it claims.
 #
-#  1. host.docker.internal, NOT localhost. The kubelet runs inside a vcluster
-#     node container, so `localhost` there is the node itself, which has no
-#     registry on 5001. host.docker.internal is Docker's embedded DNS name for
-#     the VM gateway. This is the same name the cert SAN and the containerd
-#     certs.d directory are keyed on:
-#         SAN            DNS.3 = host.docker.internal
-#         certs.d dir    /etc/containerd/certs.d/host.docker.internal:5001
-#         hosts.toml     server = "https://host.docker.internal:5001"
-#     Change the port in any one of those and the others must change with it.
+#  ── A NOTE ON TRUST ────────────────────────────────────────────────────────
+#  The registry uses a certificate we minted ourselves. A pull succeeds only if
+#  BOTH hold:
 #
-#  2. imagePullPolicy: Always, which is deliberate and load-bearing. The
-#     default is IfNotPresent, and after a successful earlier pull the image is
-#     already in the node's containerd — so IfNotPresent would satisfy the pull
-#     from local cache, the registry would never be contacted, and the CA
-#     injection would go completely untested while the pod still started green.
-#     Always forces a registry round-trip on every pod start, which is the only
-#     way the test measures what it claims to measure.
+#     (a) the CA that signed the leaf is in the store containerd consults
+#     (b) the name the kubelet dials is in that certificate's subjectAltName
 #
-#  ── A NOTE ON TRUST, because this is a SELF-SIGNED registry ────────────────
+#  (a) is what `make k8s` establishes. (b) is what the SAN list establishes.
+#  Failing (a) gives:  x509: certificate signed by unknown authority
+#  Failing (b) gives:  x509: certificate is valid for localhost, not host.docker.internal
 #
-#  A pull succeeds only if BOTH of these hold:
-#
-#     (a) the CA that signed the registry's certificate is in the trust store
-#         the node's containerd actually consults, AND
-#     (b) the hostname the kubelet dials (host.docker.internal) appears in that
-#         certificate's subjectAltName.
-#
-#  (a) is what scripts/containerd-hosts.toml + the `make k8s` step-[2/10] loop
-#  establish. (b) is what `DNS.3 = host.docker.internal` in the `certs` target
-#  establishes. Failing (a) gives:
-#     x509: certificate signed by unknown authority
-#  Failing (b) gives:
-#     x509: certificate is valid for localhost, not host.docker.internal
-#  Those two messages are the primary diagnostic this test exists to produce.
-#
-#  NOTE that scripts/containerd-hosts.toml sets `skip_verify = true`. That
-#  means (a) is NOT actually enforced during the handshake — see README
-#  finding #4. So a successful pull proves (b) and connectivity, but does not
-#  by itself prove the CA is correct. `make verify-nodes` and `make preflight`
-#  are what check the CA.
-#
+#  hosts.toml sets skip_verify = false, so BOTH are enforced at handshake time.
+#  That is deliberate: with verification off, a green pull would prove only
+#  that the path is reachable — not that the node actually trusts this registry.
 # ══════════════════════════════════════════════════════════════════════════════
-
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: regis-pull
   labels:
-    core.lab/simulation: "true"
+    lab.local/simulation: "true"
 
 ---
 apiVersion: apps/v1
@@ -85,7 +61,7 @@ metadata:
   namespace: regis-pull
   labels:
     app: nginx
-    core.lab/simulation: "true"
+    lab.local/simulation: "true"
 spec:
   # 1 replica. The question is "can a node pull this", not "can the scheduler
   # spread it", and a single pod keeps the evidence unambiguous: one node, one
@@ -102,7 +78,7 @@ spec:
     metadata:
       labels:
         app: nginx
-        core.lab/simulation: "true"
+        lab.local/simulation: "true"
     spec:
       # Deliberately NO nodeSelector. The real question is whether EVERY node
       # can pull, and pinning to one worker would hide a partially-patched
@@ -112,7 +88,7 @@ spec:
         - name: nginx
           # ↓↓↓ THE LINE UNDER TEST ↓↓↓
           image: host.docker.internal:5001/regis-nginx:alpine
-          # ↑↑↑ rewritten from .env by make deploy-nginx ↑↑↑
+          # ↑↑↑ port rewritten from .env by `make app` ↑↑↑
 
           # See point 2 in the header. Required for the test to mean anything.
           imagePullPolicy: Always

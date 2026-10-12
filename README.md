@@ -1,706 +1,416 @@
-# Why the vcluster can pull from our local registry — and what it cost us
+# **Local TLS registry + vCluster: getting a node to pull from a registry it doesn't trust**
 
-A worked explanation of one mechanism: how a container image gets from a
-self-signed Docker registry on a laptop into a Kubernetes cluster, what we found
-when we took it apart, and how we reproduced it in isolation so it could be
-fixed properly.
+## **What this is**
 
-**Written to be shared.** If you are new to this, sections 1–6 are the whole
-story. Sections 7–10 are the detail and the diagnostics.
+A self-contained lab that demonstrates one mechanism, end to end:
+A container registry with a certificate we generated ourselves, serving an image that a Kubernetes node we never configured by any supported means pulls over HTTPS — and runs.
 
----
+![Diagram 01: System Architecture Overview](diagrams/01-system-architecture-overview.svg)
 
-## Contents
-
-1. [The situation](#1-the-situation)
-2. [What "a CA cert for k8s" actually means](#2-what-a-ca-cert-for-k8s-actually-means)
-3. [The workaround, and why we needed one](#3-the-workaround-and-why-we-needed-one)
-4. [What we built to study it](#4-what-we-built-to-study-it)
-5. [What we found](#5-what-we-found)
-6. [Seeing it work](#6-seeing-it-work)
-7. [The mechanism in detail](#7-the-mechanism-in-detail)
-8. [Diagnosing a failure](#8-diagnosing-a-failure)
-9. [Full defect list](#9-full-defect-list)
-10. [What we recommend](#10-what-we-recommend)
-
----
-
-## 1. The situation
-
-We run a local container registry as part of our Docker Compose stack, and a
-local Kubernetes cluster (vcluster, running inside Docker) for the application
-workloads.
-
-```
-   ┌── your laptop ─────────────────────────────────────────────────┐
-   │                                                                │
-   │   docker compose  ──────────────►  the registry                │
-   │      core-registry                   serves images over        │
-   │      core-registry-ui                HTTPS on :5001            │
-   │                                        ▲                       │
-   │                                        │ pulls                 │
-   │   vcluster  ────────────────────────►  │                       │
-   │      4 node "containers"               │                       │
-   │      each runs a real kubelet          │                       │
-   │                                        │                       │
-   └────────────────────────────────────────┼───────────────────────┘
-                                            │
-      every application image the cluster runs
-      is fetched through here
-```
-
-The registry uses a **self-signed certificate** that we generate ourselves. It is
-not issued by a public CA and never will be — it serves on `localhost` behind
-the Docker VM gateway, so there is nothing to issue it from.
-
-The consequence: **every image pull is an HTTPS connection to a server whose
-certificate nothing trusts by default.** Before a single application container
-can start, that trust has to be established on every node.
-
-That is the whole problem. Everything below is about how it is solved, and where
-the solving is fragile.
-
----
-
-## 2. What "a CA cert for k8s" actually means
-
-Worth being precise, because two things people reach for first do **not** work.
-
-**It is not a pod-level thing.** A common instinct is to ship the CA to the
-cluster the way you ship any other configuration — a ConfigMap, a Secret, an
-env var. None of that helps. The image pull happens in the **kubelet, on the
-node**, before the pod that wants the image exists. There is no pod spec in
-which to express "trust this CA", because the pod has not been created yet.
-
-```
-   ┌─ node ──────────────────────────────────────────────┐
-   │                                                     │
-   │   kubelet ──── "I need image regis-nginx:alpine"    │
-   │      │                                              │
-   │      │  ← the pull happens HERE, on the node        │
-   │      ▼                                              │
-   │   containerd ──► HTTPS ──► registry                 │
-   │      │                                              │
-   │      └─ needs to trust the registry's CA            │
-   │                                                     │
-   │   ... the pod is created only AFTER this succeeds   │
-   └─────────────────────────────────────────────────────┘
-```
-
-**It is not `imagePullSecrets`.** A `kubernetes.io/dockerconfigjson` Secret
-carries registry *credentials* — username, password, token. It has no field for
-a certificate authority. This is a widespread and expensive misunderstanding; if
-someone reports "we added the CA to the image pull secret and it still fails",
-they are right that it still fails.
-
-**What it actually is:** the container runtime on the node — containerd — needs
-the CA in *its own* trust store, in *its own* configuration, before it will
-complete a TLS handshake with that registry.
-
-In an ordinary cluster you would arrange this by whatever provisions your nodes:
-
-```
-   a normal node
-   ┌──────────────────────────────────────────────────────────────────────┐
-   │  /etc/containerd/certs.d/                                            │
-   │    registry.example.com/                                             │
-   │      ca.crt          ← the CA, baked in by:                          │
-   │      hosts.toml      ← or written at boot by:                        │
-   │                                                node image (AMI)      │
-   │  config_path = "/etc/containerd/certs.d"       config management     │
-   │                                                (Ansible, cloud-init) |
-   │  containerd reads this at startup              privileged DaemonSet  |
-   └──────────────────────────────────────────────────────────────────────┘
-```
-
-All three routes assume the same thing: **the nodes are long-lived, and you
-control the machine they run on.** You can bake into the image, script at boot, or
-reach in with a privileged DaemonSet that mounts the host filesystem.
-
----
-
-## 3. The workaround, and why we needed one
-
-vcluster with the Docker driver does not give you any of those routes.
-
-```
-   vcluster, docker driver
-   ┌─────────────────────────────────────────────────────────────┐
-   │  "my-core1"  is not a set of VMs. It is FOUR DOCKER         │
-   │  CONTAINERS that you happened to create with `docker run`   │
-   │                                                             │
-   │    vcluster.cp.my-core1                                     │
-   │    vcluster.node.my-core1.worker-1      ← real containers   │
-   │    vcluster.node.my-core1.worker-2         each with its    │
-   │    vcluster.node.my-core1.worker-3         own filesystem,  │
-   │                                               destroyed     │
-   │                                               and recreated │
-   │                                               at will       │
-   └─────────────────────────────────────────────────────────────┘
-
-   no node image to bake into
-   no boot script to run
-   no config management reaches inside
-   a DaemonSet could mount the host, but the "host" here is the
-      Docker VM, not the node — it would not reach containerd
-```
-
-**The lever we do have** is the one that created them: the `docker` CLI. If the
-node is a container, we can go inside it.
+The interesting part is not the registry — it is what it takes to make a Kubernetes node trust a certificate nobody has ever heard of.
 
 ```bash
-docker exec <node> …      # run a command inside the node
+make run && make pull && make build && make k8s && make app
+```
+
+That is the whole cycle. §8 walks through it line by line, including the teardown.
+
+## Overview - First... 
+
+**The What**
+
+Little deeper. Regarding our local stack. It all starts as a local Docker engine, onto which we then deploy [vCluster](https://www.vcluster.com) which in turn host our Kubernetes environment, also known as VIND (vCluster in Docker). 
+
+At this point the vCluster container images etc run on our local [Docker](https://www.docker.com) engine. 
+
+All images used to deploy our environment are sourced from the local [Docker Container Registry](https://www.docker.com/products/docker-hub/). Life is still good and simple at this point.
+
+We now create our project deployment Manifest files. These follow the structure of: `image: <Source/imageName:tag>`.
+
+First option, and easiest, simply pull (reference) public registries directly. But this starts becoming a pain when during a high cadence development cycle you compile/build/verify/fix/repeat.
+
+So this works, if you don't deploy/redeploy allot, this works, if your security department does not force a local verified container registry.
+
+So what now... ok, so we execute `pull <source/imageName:tag` pulling the container images into our local Docker Registry and we recode the manifest files, pointing them locally.
+
+And here is where life gets interesting. When we now try and point to the Docker registry in the Manifest files things fall apart. We get can't find the images. To remedy this we copy the container images onto each Kubernetes node prior to the manifest file being applied. All's working again.
+
+But, if this is 5 images, no worries, but it quickly becomes a pain when your project is 30 images, that you recompile and rebuild in a cycle, each time requiring you to re-copy them back onto your Kubernetes nodes before being able to deploy.
+
+This is the **what we fix** below.
+
+**Now: The How**
+
+Our solution, We host a registry on Docker Compose](https://docs.docker.com/compose/) ontop of our [Docker Engine](https://www.docker.com) and we then reference that URL endpoint as container source. 
+
+Why [Docker Compose](https://docs.docker.com/compose/) you ask, well to simulate a larger "corporate" environment we might already be simulating various shared services like a Kafka cluster, a Hashicorp Vault, or (...). The registry simply becomes another shared service, that we want to provide, that does not belong to the consumer in this case, being the application being deployed on the Kubernetes cluster.
+
+Things are never just easy... Because all of this is local, the Kubernetes cluster, or make that the containerd processes specifically (and our world of we dont trust anything anymore) want the source images to be signed. So we have to do a little work around, in a production space your registry would have a registered host name with a registered certificate.
+
+## **1. The situation**
+
+The registry uses a **self-signed certificate** we generate ourselves. It is not issued by a public CA and never will be — it serves on localhost behind the Docker VM gateway, so there is nothing to issue it from.
+
+The consequence: every image pull is an HTTPS connection to a server whose certificate nothing trusts by default. Before a single application container can start, that trust has to be established on every node.
+
+That is the whole problem. Everything below is about how it is solved, and where the solving is fragile.
+
+## **2. What "a CA cert for k8s" actually means**
+
+Worth being precise, because two things people reach for first do not work.
+
+It is not a pod-level thing. A common instinct is to ship the CA to the cluster the way you ship any other configuration — a ConfigMap, a Secret, an env var. None of that helps. The image pull happens in the **kubelet, on the node**, before the pod that wants the image exists. There is no pod spec in which to express "trust this CA", because the pod has not been created yet.
+
+![Diagram 02a: Node Level Pull vs Pod Creation](diagrams/02a-node-level-pull-vs-pod-creation.svg)
+
+![Diagram 02b: Normal Node Provisioning Routes](diagrams/02b-normal-node-provisioning-routes.svg)
+
+**It is not `imagePullSecrets`.** A `kubernetes.io/dockerconfigjson` Secret carries registry *credentials* — username, password, token. It has no field for a certificate authority. This is a widespread and expensive misunderstanding; if someone reports "we added the CA to the image pull secret and it still fails", they are right that it still fails.
+
+**What it actually is:** the container runtime on the node — containerd — needs the CA in its own trust store, in its own configuration, before it will complete a TLS handshake with that registry.
+
+In an ordinary cluster you would arrange this by whatever provisions your nodes: bake the CA into the node image, script it at boot, or reach in with a privileged DaemonSet that mounts the host filesystem.
+
+## **3. Why a vCluster is the hard case**
+
+[vCluster](https://www.vcluster.com) with the Docker driver does not give you any of those routes.
+
+![Diagram 03: vCluster Docker Driver Containers](diagrams/03-vcluster-docker-driver-containers.svg)
+
+**The lever we do have** is the one that created them: the docker CLI. If the node is a container, we can go inside it.
+
+```bash
+docker exec <node> …              # run a command inside the node
 docker cp  <file> <node>:<path>   # put a file inside the node
 ```
 
-So the workaround is: **treat each Kubernetes node as a Docker container and
-reach into it with the Docker CLI after it has been created.**
+So the workaround is: **treat each Kubernetes node as a Docker container and reach into it with the Docker CLI after it has been created.**
 
 That is the entire trick. Concretely, for each of the four node containers:
 
-```
-  1.  make a directory for the CA to live in
-        docker exec <node> mkdir -p /etc/containerd/certs.d/host.docker.internal:5001
+```bash
+#  1.  make the directory the CA will live in
+docker exec <node> mkdir -p /etc/containerd/certs.d/host.docker.internal:5001
 
-  2.  copy the CA into it
-        docker cp ca.crt  <node>:/etc/containerd/certs.d/host.docker.internal:5001/ca.crt
+#  2.  copy the CA into it
+docker cp ca.crt <node>:/etc/containerd/certs.d/host.docker.internal:5001/ca.crt
 
-  3.  copy the instruction file beside it
-        docker cp hosts.toml <node>:/etc/containerd/certs.d/host.docker.internal:5001/hosts.toml
+#  3.  copy the instruction file beside it
+docker cp hosts.toml <node>:/etc/containerd/certs.d/host.docker.internal:5001/hosts.toml
 
-  4.  tell containerd that directory is where it should look
-        docker exec <node> sed -i 's|config_path = ""|
-                                      config_path = "/etc/containerd/certs.d"|' …
+#  4.  tell containerd that directory is where it should look
+docker exec <node> sed -i 's|config_path = ""| config_path = "/etc/containerd/certs.d"|' …
 
-  5.  make containerd notice
-        docker exec <node> pkill -HUP containerd
-```
-
-**Why this is a workaround and not a solution:** it is a post-hoc patch applied
-by an external process over the Docker API, to state that lives inside a
-container's writable layer. It has no lifecycle. Every assumption it rests on
-can be broken silently:
-
-- the nodes are **recreated** on any `vcluster delete`/`create`, and on
-  rescheduling after a crash — and the CA is gone, because it was never in the
-  image and never on a volume;
-- nothing in the normal Kubernetes workflow **re-runs it**;
-- every step's failure is **individually discarded**, and success is printed
-  unconditionally.
-
-Which brings us to what we found.
-
----
-
-## 4. What we built to study it
-
-Studying this inside the full stack is impractical — the registry is one service
-among eleven, and the cluster is one of four. So we extracted *only this
-mechanism* into a directory that runs on its own.
-
-```
-  this project                          the source it came from
-  ─────────────                         ─────────────────────────
-  docker-compose.yml      ── extract ──► deploy/docker-compose.yml
-      core-registry, core-registry-ui      (8 other services removed)
-
-  .env                    ── extract ──► deploy/.env
-  vcluster1.yml           ── extract ──► deploy/vcluster1.yml
-  scripts/
-    containerd-hosts.toml ── extract ──► deploy/scripts/containerd-hosts.toml
-    purge_registry.sh     ── extract ──► deploy/scripts/purge_registry.sh
-    recover_registry_ca.sh── extract ──► deploy/scripts/recover_registry_ca.sh
-  Makefile                ── extract ──► deploy/Makefile
-      certs, registry-up, vcluster-up,      (certs target, k8s step [2/10])
-      patch-nodes                            copied VERBATIM
-  k8s/1.01.nginx-pull-test.yaml  ── added ──►  (no equivalent exists)
-  verify-extract.sh        ── added ──►     (proves the extraction is intact)
+#  5.  make containerd notice — and WAIT for it
+docker exec <node> systemctl restart containerd
 ```
 
-**It is an extraction, not a rewrite.** The registry services are byte-identical
-to the source apart from a set of renames (§7.4), and the `certs` recipe and the
-`k8s` step-`[2/10]` injection loop are copied verbatim — **including the parts
-that are wrong**, because correcting them would destroy the thing we are trying
-to study.
+**Why this is a workaround and not a solution:** it is a post-hoc patch applied by an external process over the Docker API, to state that lives inside a container's writable layer. It has no lifecycle. The nodes are recreated on any make `k8s-down` / `make k8s`, and on rescheduling after a crash — and the CA is gone, because it was never in the image and never on a volume.
 
-`./verify-extract.sh` proves this mechanically:
+That is why it lives in `scripts/patch_nodes_ca.sh` and not in a make recipe: a chain of docker cp steps with no seam is the thing most worth being able to assert against.
+
+## **4. Two vantage points, and why the gateway name**
+
+There are two ways to reach the registry, and they are **not interchangeable**:
+
+![Diagram 07b: Gateway DNS Resolution Paths](diagrams/07b-gateway-dns-resolution-paths.svg)
+
+`host.docker.internal` is Docker's embedded DNS name for the VM gateway. It resolves to the host from inside any container, and the host's published port is then reachable. This is the fact the whole design rests on, and it is why the certificate, the trust store and the image reference all key on it.
+
+A TLS client checks **the name it dialled** against the certificate's SAN list — not the server's own hostname. So there is one SAN per *client vantage point*:
+
+| SAN | Who Dials It | Do They Verify? |
+| :---- | :---- | :---- |
+| `localhost` | Host-side tools: `curl --cacert … https://localhost:5001` | Yes |
+| `regis-registry` | The UI's nginx, via `NGINX_PROXY_PASS_URL` | **No — NGINX_PROXY_SSL_VERIFY: "off"** |
+| `host.docker.internal` | **The vCluster kubelet** | **Yes ★** |
+| `127.0.0.1` | IP-literal clients | Yes |
+
+Two conditions must **both** hold for a real pull to succeed:
+
+| Condition | Established By | Result If Failed |
+| :---- | :---- | :---- |
+| **(a)** The CA that signed the leaf is in the store containerd consults | `patch-nodes` | `certificate signed by unknown authority` |
+| **(b)** The dialled name is in the certificate's SANs | `DNS.3` in `make certs` | `certificate is valid for localhost, not host.docker.internal` |
+
+## **5. The authority: derive it once**
+
+The address `host.docker.internal:5001` has to appear in **five** places, and if any one of them disagrees with the others the CA can be present, correct, and never consulted — with no error and no log line anywhere:
+
+![Diagram 05: Registry Authority Fanout — five places, zero validation](diagrams/05-registry-authority-fanout.svg)
+
+The dangerous one is **[2]**. The directory containerd scans is named after the registry host. Put the CA in `certs.d/localhost:5001/` and containerd is looking for a registry called `localhost:5001` — which is not the one the node dials. You get a correct certificate, installed exactly as instructed, in a directory nothing will ever read.
+
+So this project derives it **once**, in the Makefile, and renders everything else from it:
+
+```makefile
+include .env
+REGISTRY_HOST      ?= host.docker.internal
+REGISTRY_PORT      ?= $(HOST_PORT_REGISTRY)
+REGISTRY_AUTHORITY := $(REGISTRY_HOST):$(REGISTRY_PORT)
+CERTSD_IN_NODE     := /etc/containerd/certs.d/$(REGISTRY_AUTHORITY)
+```
+
+`hosts.toml` is not committed with a port baked into it — it is a **template** (`scripts/containerd-hosts.toml.tmpl`) rendered at build time. Change `HOST_PORT_REGISTRY` in `.env` and all five follow. The mismatch family is structurally impossible.
+
+And if the port is missing, the Makefile fails at parse time naming the real cause, rather than surfacing much later as a `curl` error that reads like a registry fault:
 
 ```
-  1. verbatim files            every extracted file, compared byte-for-byte
-  2. docker-compose.yml        the registry services == source, modulo the
-                               declared renames — nothing else may differ
-  3. Makefile recipes          the specific lines that carry the behaviour
-  4. compose project isolation our project name cannot collide with the source's
-  5. declared deviations       every difference, enumerated
+Makefile:65: *** HOST_PORT_REGISTRY is not set in .env — the registry authority cannot be derived.  Stop.
 ```
 
-If it fails, the reproduction has drifted and nothing concluded from it is
-worth anything.
+## **6. The mechanism, in detail**
 
-**What is deliberately not extracted:** the source's own Kubernetes manifests.
-They are the real application services, and each one needs a ServiceAccount,
-ConfigMaps, a Vault Secret and a full configuration surface before it does
-anything. That is the wrong shape for isolating an image pull — and it is where
-we found one of the bugs (D5). So the test workload is a stock `nginx:alpine`,
-whose two load-bearing lines are byte-identical in form to the source's:
+The story is above. This is the machinery.
+
+### Chain of custody
+
+![Diagram 06a: Chain of Custody](diagrams/06a-chain-of-custody.svg)
+
+### What `certs/` holds
+
+![Diagram 06b: What certs/ Holds](diagrams/06b-certs-directory.svg)
+
+The CA is long-lived and the leaf is deliberately short — a 2-day clock on the thing that actually gets presented. Everything else is derived and disposable.
+
+### How the registry serves it
 
 ```yaml
-# source    k8s/core1/4.04.users.deployment-service.yaml
-image: host.docker.internal:5001/core-users:0.6
-imagePullPolicy: Always
-
-# here      k8s/1.01.nginx-pull-test.yaml
-image: host.docker.internal:5001/regis-nginx:alpine
-imagePullPolicy: Always
+volumes:
+  - ./data/registry:/var/lib/registry
+  - ./data/registry/certs:/certs:ro
+environment:
+  REGISTRY_STORAGE_DELETE_ENABLED: "true"
+  REGISTRY_HTTP_TLS_CERTIFICATE: /certs/server.crt
+  REGISTRY_HTTP_TLS_KEY: /certs/server.key
 ```
+
+Trusting is the client's job. The registry is handed the **leaf only**, read-only:
+it presents and waits.
+
+`REGISTRY_STORAGE_DELETE_ENABLED` is required because `registry:2` refuses
+`DELETE /v2/<name>/manifests/<digest>` without it — which the UI's delete
+controls and `scripts/purge_registry.sh` both depend on.
+
+### The healthcheck trap
+
+```yaml
+test: ["CMD-SHELL", "wget --no-check-certificate -q -O /dev/null https://localhost:5000/v2/_catalog || exit 1"]
+```
+
+`registry:2` is scratch-based: no shell beyond busybox, and **no `curl`**. A
+`curl`-based probe exits 127, `|| exit 1` fires, and Docker marks the container
+`unhealthy` while the registry is serving 200s perfectly well.
+
+The UI depends on `service_started`, not `service_healthy`, so it keeps working
+throughout. That is what makes this one nasty: a red status on a perfectly
+healthy registry, which sends you hunting for a fault that does not exist.
+
+### Before and after, inside a node
+
+![Diagram 06c: Before and After Inside a Node](diagrams/06c-node-before-after.svg)
 
 ---
 
-## 5. What we found
+## **7. `skip_verify`, and why the CA goes into two places**
 
-Eight defects. The full list with evidence is in §9; the four that matter most:
+This is the part that took the longest to get right, and it is worth reading even if you never run the lab.
 
-### The one string that must agree in five places  ·  **D6, the worst**
+The obvious configuration for a self-signed registry is:
 
-The registry's address — `host.docker.internal:5001` — appears in **five**
-places, written in three different files, with nothing checking that they agree:
-
-```
-                host.docker.internal:5001
-                ═══════════════════════════════
-   ┌──────────────┬───────────────┬───────────────┬─────────────┐
-   ▼              ▼               ▼               ▼             ▼
- [1] SAN      [2] certs.d     [3] hosts.toml  [4] ca_file   [5] image
- DNS.3 in     directory      server =        path inside  reference in
- san.cnf      name           "https://…:5001"hosts.toml  the manifest
-
- Makefile     Makefile       scripts/        scripts/     k8s/*.yaml
- `certs`      cp target      containerd-     containerd-  (rendered)
-                             hosts.toml      hosts.toml
-```
-
-If any one of them disagrees with the others, the CA can be present, correct,
-and **never consulted**. No error, no warning, no log line.
-
-**The dangerous case is [2].** The directory containerd scans is named after the
-registry host. Put the CA in `certs.d/localhost:5001/` and containerd is looking
-for a registry called `localhost:5001` — which is not the one the node dials. You
-get:
-
-```
-  ca.crt      present   ✔
-  hosts.toml  present   ✔
-  config_path set       ✔
-  → "✓ node patched"
-  → every pull: x509: certificate signed by unknown authority
-```
-
-A correct certificate, installed exactly as instructed, in a directory nothing
-will ever read.
-
-**And our own project README teaches this.** The source's `README.md` documents
-the certs.d path as `localhost:5001`. Anyone following it reproduces this failure
-precisely, with a green tick printed. The source code uses
-`host.docker.internal:5001`; only the documentation is wrong. That divergence
-between the docs and the code is finding D6.
-
-### The "reload" is a kill  ·  **D2**
-
-The last step of the workaround is `pkill -HUP containerd`. It is commented as a
-reload, and described as one in the README. It is not a reload — **it terminates
-containerd**:
-
-```
-  before      pid=1260   systemd=active
-  pkill -HUP containerd
-  t+ 2s       pid=-      systemd=activating
-  t+ 4s       pid=-      systemd=activating
-  t+ 6s       pid=-      systemd=activating
-  t+ 8s       pid=2174   systemd=active      ← different PID
-```
-
-It only appears to work because systemd starts a *new* process (note the PID
-change) about seven seconds later. For those seven seconds **every node has no
-container runtime at all**, and every pod on it is stuck. The loop has already
-printed `✓ <node> patched`.
-
-`systemctl restart containerd` is survivable; SIGHUP is not.
-
-### Nothing in the loop can fail  ·  **D3**
-
-All five steps of the workaround are individually guarded with
-`2>/dev/null || true`, and `✓ <node> patched` is echoed unconditionally. A missing
-`hosts.toml`, a wrong directory name, a `config_path` that never took — all
-produce the same output as a correct patch. Combined with the finding above,
-this is what makes that entire failure family invisible.
-
-### The CA is supplied and then not verified  ·  **D4**
-
-```toml
+```toml  
 [host."https://host.docker.internal:5001"]
-  ca_file = "/etc/containerd/certs.d/host.docker.internal:5001/ca.crt"
-  skip_verify = true          ← …and then not checked
+ca_file = "/etc/containerd/certs.d/host.docker.internal:5001/ca.crt"
+skip_verify = true          # ← …and then don't check it
 ```
 
-Those two lines contradict each other. The CA is handed to containerd and
-verification is switched off, so **a pull succeeds even if `ca.crt` is the wrong
-CA, or is stale.** The failure this whole mechanism exists to prevent — a node
-that cannot verify the registry — is therefore undetectable from the pull result.
+Those two lines contradict each other. The CA is handed to containerd and verification is switched off, so **a pull succeeds even if `ca.crt` is the wrong CA, or is stale.** We proved this: with a certificate reading `CN=BOGUS Unrelated CA` installed on a node, a pod still pulled and ran.
 
-A green deployment is not evidence that the trust chain works. It is evidence
-that the path is reachable.
+> **A green deployment is not evidence that the trust chain works. It is evidence that the path is reachable.**
 
----
+So `skip_verify` is `false` here, and certificate verification is genuinely enforced. Which immediately exposed the next thing:
 
-## 6. Seeing it work
+**With `skip_verify = false`, and the CA present only in `certs.d`, every pull failed** — `x509: certificate signed by unknown authority` — on containerd v2.2.3 with `version = 3` config. The CA was valid (`openssl verify` confirmed it), it was in the right directory, the fingerprint matched, and containerd still refused it. Only the `skip_verify` flag was being honoured; the `ca_file` was not being applied.
 
-The demonstration is: a registry we run ourselves, with a certificate we
-generated ourselves, serving an image that a Kubernetes node we never configured
-by any supported means pulls over HTTPS and runs.
+Installing the byte-identical CA into the node's **system** trust store (`/usr/local/share/ca-certificates/` + `update-ca-certificates`) made the same pull succeed immediately.
+
+| Store | Consumer | Set up by | Actually load-bearing? |
+|:---|:---|:---|:---|
+| `/usr/local/share/ca-certificates/` | containerd's **system roots** | `make k8s` | **Yes — this is the one that works** |
+| `/etc/containerd/certs.d/…` | containerd, per-registry config | `make k8s` | No — see below |
+| `~/.docker/certs.d/` | the **docker daemon**, for `push` | `make build` | No — see below |
+
+So the patch script installs the CA into containerd's two stores, and `make build`
+installs it for the daemon. Two consequences worth stating plainly:
+
+- With `skip_verify = false` and only `certs.d` populated, **everything fails**.
+- With `skip_verify = true`, the `certs.d` CA is **never consulted**, so the whole
+  mechanism appears to work while proving nothing.
+
+### The third store, which turned out not to exist
+
+We assumed the docker daemon needed the CA installed, because `curl --cacert` and the daemon are different trust paths and only the first is under our control. **It didn't need it.** `docker info` reports:
+
+Loopback is exempt, so the daemon skips verification for `localhost:5001` outright. Measured, with the CA files deleted:
+
+Same endpoint, same moment. One verifies; the other does not. And the exemption is **loopback-specific** — pushing via the gateway name does verify:
+
+That failure persisted even *with* the CA correctly installed, because Docker Desktop does not read `~/.docker/certs.d/` until it is restarted. So the install in `make build` is belt-and-braces: it buys you the ability to push via the gateway name, on a daemon that has been restarted. We push via loopback, so the lab never depends on it.
+
+**The asymmetry worth remembering:** the *push* can go unverified and nobody notices; the *pull* never can. containerd has no loopback exemption, and it dials the gateway name regardless. Every trust failure this lab has ever shown upstream of the image pull, not the push.
+
+![Diagram 07c: Push Verification Asymmetry](diagrams/07c-push-verification-asymmetry.svg)
+
+### The check that catches all of it
+
+`scripts/patch_nodes_ca.sh` asserts seven things per node and exits non-zero if any fail. The last one is the one that matters:
 
 ```bash
-# 0. prove the reproduction is still faithful to the source
-make verify-extract
+docker exec <node> openssl s_client -connect host.docker.internal:5001 \
+    -servername host.docker.internal </dev/null | grep 'Verify return code'
+```
 
-# 1. generate the certificates and start the registry
-make registry-up        # openssl → ca.crt + server.crt; compose up; wait for HTTPS
-make preflight          # is the CA on disk the one the registry is serving?
-make catalog
+A real, **verified** TLS handshake from inside the node, against the system trust store, with no `-CAfile` — because that is the path containerd actually uses. Everything before it checks that files are in the right place with the right bytes. This checks that the node can genuinely complete the handshake.
 
-# 2. put an image in it
-make push-nginx         # docker pull nginx:alpine → retag → push
-make catalog            # regis-nginx appears
+Caught in testing, by that check alone:
 
-# 3. create the cluster and inject the CA into every node
-make vcluster-up        # vcluster create + the five-step injection, per node
-make verify-nodes       # read back what actually landed
+```
+✗ worker-2   system trust store holds a DIFFERENT CA than the registry is serving
 
-# 4. the assertion
-make deploy-nginx
-kubectl -n regis-pull get events --sort-by=.lastTimestamp | grep -i pull
+    node: 55:0E:D0:10:…
+
+    want: 9A:C5:16:1F:…
+
+    the registry was re-minted after this node was patched — run: make patch-nodes
+```
+
+and `make app` refuses rather than deploying:
+
+```
+ERROR: a node does not trust the current CA — run: make patch-nodes
+```
+
+## **8. Seeing it work**
+
+![Diagram 07a: Certificate Chain of Custody](diagrams/07a-certificate-chain-of-custody.svg)
+
+| Component | Endpoint |
+|:---|:---|
+| Registry | `https://localhost:5001` |
+| Registry UI | `http://localhost:8080` |
+| Nodes dial | `host.docker.internal:5001` |
+
+```bash
+make clean           # start from nothing — this deletes the CA too
+
+make run             # mint certs, start the registry, wait for HTTPS
+make preflight       # is the CA on disk the CA the registry is SERVING?
+make catalog         # empty
+
+make pull            # fetch nginx:alpine into local Docker
+make build           # push that image into the registry
+make catalog         # regis-nginx appears
+
+make k8s             # create the cluster + inject the CA into every node
+make verify-nodes    # read back what landed, and prove the handshake
+
+make app             # the assertion
+kubectl -n regis-pull get events --sort-by=.lastTimestamp | grep -i pulled
 #  → Successfully pulled image "host.docker.internal:5001/regis-nginx:alpine"
 
-# 5. and prove the result means something
-make pull-test-fail     # a tag that does not exist MUST fail
-make status
+make pull-test-fail  # a tag that does not exist MUST fail
+make status          # one screen across every layer
+
+# Teardown is total — every directory under ./data goes, certificates included:
+make down            # compose down, wipe ./data/registry
+make k8s-down        # delete the cluster, wipe ./data/cluster
+make clean           # both
 ```
 
-Step 5 is not ceremony. With a self-signed registry, a wrong CA, a wrong tag, an
-unresolvable host and a dead registry **all produce the same `ErrImagePull`**.
-Without a test that must fail, "it worked" is indistinguishable from "the image
-was already cached on the node".
+Because teardown destroys the CA, the cycle is always `run → pull → build → k8s → app`. Anything that needs a trusted node checks it first and refuses to proceed if that is not true.
 
-### Two things the repo does not set up for you
+**The negative control is not ceremony.** With a self-signed registry, a wrong CA, a wrong tag, an unresolvable host and a dead registry all produce the same `ErrImagePull`. Without a test that must fail, "it worked" is indistinguishable from "the image was already cached on the node" — which is exactly what `imagePullPolicy: Always` exists to prevent.
 
-1. **The Docker daemon's own trust store.** `curl` honours `--cacert`, so every
-   preflight passes; but `docker push` goes through the daemon, which has a
-   separate store that nothing populates. `make push-nginx` installs the CA and
-   tells you if a restart is needed. Details in §7.5.
-2. **kubectl must point at the cluster** — `make k8s-use`. Note that
-   `vcluster connect --update-current=true` rewrites the **global**
-   current-context, so anything else you have running follows the switch. Use a
-   scoped `KUBECONFIG` if other work is in flight.
+## **9. Diagnosing a failure**
 
----
+| Symptom | Failing Condition & Root Cause |
+| :---- | :---- |
+| `x509: certificate signed by unknown authority` | **Condition (a):** CA not trusted. Check `ca.crt` in node, system trust store, or verify if certificate is stale. |
+| `x509: certificate is valid for localhost, not host.docker.internal` | **Condition (b):** SAN missing. |
+| `x509: certificate has expired` | 2-day leaf certificate expired. |
+| `lookup host.docker.internal: no such host` | DNS resolution failure, not TLS. |
+| `connection refused` | Registry is not listening. |
+| `manifest unknown / 404` | Requested tag does not exist in the registry. |
 
-## 7. The mechanism in detail
+```bash  
+make status          # every layer, one screen
+make preflight       # is the CA on disk the CA the registry is SERVING?
+make verify-nodes    # ca + hosts.toml + config_path + fingerprint + handshake
+make catalog         # is the tag there?
 
-### 7.1 Chain of custody
+node=vcluster.node.my-regis1.worker-1   # or vcluster.cp.my-regis1
 
-```
-  ①  make certs                openssl, on the host
-     ─────────►               ca.key ──signs──► ca.crt   (CA, 730 days)
-                                             │signs
-                                             ▼
-                                        server.crt          (leaf, 2 days)
-                                        SAN: localhost
-                                             core-registry
-                                             host.docker.internal  ★
-                                             127.0.0.1
-
-  ②  compose mounts            core-registry serves HTTPS on :5000
-     ─────────►               /certs/server.{crt,key}   (read-only bind mount)
-                              the CA is NOT given to the registry — only to
-                              the clients. The registry presents and waits.
-
-  ③  k8s step [2/10]          into each node container:
-     ─────────►               certs.d/host.docker.internal:5001/{ca.crt,hosts.toml}
-                              config_path = "/etc/containerd/certs.d"
-                              pkill -HUP containerd        (a kill — D2)
-
-  ④  the kubelet pulls        CRI → containerd → reads hosts.toml → HTTPS
-     ─────────►               the CA is in place, the name is in the SAN,
-                              the pull succeeds, the container runs
+docker exec $node ls -la /etc/containerd/certs.d/host.docker.internal:5001/
+docker exec $node cat    /etc/containerd/certs.d/host.docker.internal:5001/hosts.toml
+docker exec $node grep    config_path /etc/containerd/config.toml
+docker exec $node sh -c 'systemctl is-active containerd'
+docker exec $node journalctl -u containerd --no-pager -n 20
 ```
 
-### 7.2 Why the gateway name, and not `localhost`
+`make preflight` exists to separate two failures that look identical from a pull: **the registry is down**, and **the registry is serving a different certificate than the one on disk**.
 
-```
-  ┌─ your Mac ──────────────────────────────────────────────────┐
-  │   host process → https://localhost:5001   (published port)  │
-  │                                                             │
-  │   ┌─ Docker Desktop VM ───────────────────────────────────┐ │
-  │   │  a vcluster node                                      │ │
-  │   │    "localhost" here = THIS CONTAINER                  │ │
-  │   │    there is no registry on :5001 inside it            │ │
-  │   │                                                       │ │
-  │   │    host.docker.internal ──► VM gateway ──► host       │ │
-  │   │                          ──► published port 5001      │ │
-  │   └───────────────────────────────────────────────────────┘ │
-  └─────────────────────────────────────────────────────────────┘
+## **10. What we found along the way**
 
-  host-side tools   →  localhost:5001
-  kubelet in a node →  host.docker.internal:5001
-```
+Each of these was measured on this lab, not inferred.
 
-`host.docker.internal` is Docker's embedded DNS name for the VM gateway. It
-resolves to the host from inside any container, and the host's published port is
-then reachable. **This is the fact the whole design rests on**, and it is why the
-certificate, the trust store and the image reference all key on it.
+![Diagram 09: Teardown Orphans the Trust Anchor](diagrams/09-teardown-orphaning.svg)
 
-### 7.3 What each certificate name is for
+| Ref # | Finding | Consequence | Implementation Fix |
+|:---|:---|:---|:---|
+| **1** | `skip_verify = true` beside a `ca_file` means the CA is never verified | A pod pulls fine with a deliberately bogus CA installed | **Fixed** — `skip_verify = false` |
+| **2** | With verification on, containerd honours `skip_verify` from `hosts.toml` but did not apply `ca_file` from it | `certs.d` alone is **inert**; every pull fails | **Worked around** — CA also installed to the system store |
+| **3** | `kill -SIGHUP containerd` is a kill, not a reload | ~5–7s with no runtime on every node, reported as success | **Fixed** — `systemctl restart`, then wait for `is-active` |
+| **4** | Every step of a multi-node patch was wrapped in `|| true` with an unconditional `✓` | The loop cannot fail, so it proves nothing | **Fixed** — `patch_nodes_ca.sh` asserts and exits non-zero |
+| **5** | File *presence* is not file *identity* | After a CA rotation every node still "has" a `ca.crt` — an orphaned anchor that validates nothing | **Fixed** — Fingerprints compared |
+| **6** | Presence, even with a fingerprint, is not a working handshake | Five green checks can coexist with a node that cannot verify the registry | **Fixed** — Live `openssl s_client` assertion |
+| **7** | Assumed the docker daemon needed the CA, since `curl --cacert` and the daemon are separate trust paths | On loopback it never did — Docker exempts `127.0.0.0/8`, so `push` was never verifying | **Corrected** — `make build` still installs it, for daemons that don't exempt loopback |
+| **8** | Teardown destroys the CA; a cluster left standing across that boundary holds an orphaned one | Pulls fail, or silently succeed against the wrong anchor | **Fixed** — `make app` verifies before deploying |
 
-A TLS client checks **the name it dialled** against the certificate's SAN list —
-not the server's own hostname, and not what the client believes the server to be.
-So there is one entry per *client vantage point*:
+The general lesson, and the reason this is written down: **a green result from a chain you cannot inspect is not evidence.** Every one of the eight above is a case where the output said ✓ and the mechanism did not work — or, worse, worked for a reason that had nothing to do with the thing being claimed.
 
-| SAN | who dials it | do they verify? |
-|---|---|---|
-| `localhost` | host-side tools: `curl --cacert … https://localhost:5001` | yes |
-| `core-registry` | the UI's nginx, via `NGINX_PROXY_PASS_URL` | **no** — `NGINX_PROXY_SSL_VERIFY: "off"` |
-| `host.docker.internal` | **the vcluster kubelet** | **yes** ★ |
-| `127.0.0.1` | IP-literal clients | yes |
+## **11. Purging and recovering**
 
-Measured, against a certificate carrying the first three, with the CA trusted by
-the client:
-
-```
-  name the CLIENT dials        verdict
-  ──────────────────────────   ──────────────────────────────────
-  localhost                    ✅ accepted
-  core-registry                ✅ accepted
-  wrong.example                ❌ Hostname mismatch
-```
-
-**Two conditions must both hold** for a real pull to succeed:
-
-| | condition | established by | if it fails |
-|---|---|---|---|
-| **(a)** | the CA that signed the leaf is in the store containerd consults | `hosts.toml` + `ca.crt` + `config_path` | `certificate signed by unknown authority` |
-| **(b)** | the dialled name is in the certificate's SANs | `DNS.3 = host.docker.internal` | `certificate is valid for localhost, not host.docker.internal` |
-
-And because of D4, **(a) is not actually enforced at runtime.** A successful pull
-proves (b) and connectivity — not that the CA is correct.
-
-### 7.4 Why we renamed things
-
-`container_name` and the compose project name are **docker-daemon-global**, not
-scoped to a directory, and a vcluster name is global to the vcluster CLI. Sharing
-them with the source means `docker compose -p <project> down` or
-`vcluster delete <name>` from either directory destroys the other's containers,
-volumes and cluster. This is not theoretical — it happened, repeatedly, before
-the renames.
-
-| this project | source | what |
-|---|---|---|
-| `regis` | `corebanking` | compose project + network |
-| `regis_registry`, `regis_registry_ui` | `core_registry`, `core_registry_ui` | compose service keys |
-| `regis-registry`, `regis-registry-ui` | `core-registry`, `core-registry-ui` | `container_name`, `hostname`, proxy URL |
-| `my-regis1` | `my-core1` | vcluster |
-| SAN `DNS.2 = regis-registry` | `core-registry` | certificate name |
-
-**The mechanism is untouched.** Only resource identity changed.
-
-> **A trap worth knowing:** renaming `name: regis` in the compose file is *not*
-> sufficient. Docker Compose resolves the project name as
-> `-p flag > COMPOSE_PROJECT_NAME (env) > name: (file)`, and the extracted `.env`
-> is verbatim and pins `COMPOSE_PROJECT_NAME=corebanking`, which beats the file.
-> Isolation comes from setting both. `verify-extract.sh` §4 checks the resolution
-> empirically.
-
-### 7.5 The second trust store
-
-| | who needs it | when | set up? |
-|---|---|---|---|
-| **containerd** in each node | the kubelet | pull | **yes** — step `[2/10]` |
-| **docker daemon** on the host | `docker push` | build | **no** |
-
-The source defers verification explicitly — `scripts/deploy-app.sh`:
+### Purging the registry
 
 ```bash
-# Use -k for preflight (self-signed cert); CA cert verification happens at build/push time
+./scripts/purge_registry.sh         # delete every manifest, registry stays up
+./scripts/purge_registry.sh --full  # volume wipe; PRESERVES certs/
 ```
 
-and `core/build/Makefile` then honours it with `curl --cacert`, before running
-`docker buildx --push`, which goes through the daemon. The preflight proves the
-CA one way; the push needs it known another way. The deferral lands in the gap.
+`--full` deliberately keeps `certs/`. Wiping it would destroy the CA private key
+while nodes still hold the old public CA — the orphaned-trust-anchor state.
 
----
+### Recovering a CA you have lost
 
-## 8. Diagnosing a failure
-
-```
-  symptom                                        → condition failed
-  ─────────────────────────────────────────────────────────────────────
-  x509: certificate signed by
-    unknown authority                                (a) CA not trusted
-                                                     ↳ ca.crt in the node?
-                                                       hosts.toml there?
-                                                       config_path set?
-                                                       …or is the CA STALE (D7)?
-  x509: certificate is valid for
-    localhost, not host.docker.internal              (b) SAN missing
-  x509: certificate has expired                       2-day leaf expired
-  lookup host.docker.internal: no such host          DNS, not TLS
-  connection refused                                 registry not listening
-  manifest unknown / 404                             tag not in the registry
-  manifest rejected by the API server                scheme in the image ref
-```
+If `certs/` is gone but the nodes are still standing, the CA can be copied back
+out of a node and verified against the live endpoint:
 
 ```bash
-make preflight      # is the CA on disk the CA the registry is SERVING?
-make verify-nodes   # is ca.crt + hosts.toml + config_path in each node?
-make catalog        # is the tag there?
-
-docker exec <node> ls -la /etc/containerd/certs.d/host.docker.internal:5001/
-docker exec <node> cat    /etc/containerd/certs.d/host.docker.internal:5001/hosts.toml
-docker exec <node> grep    config_path /etc/containerd/config.toml
-docker exec <node> sh -c 'systemctl is-active containerd'
-docker exec <node> journalctl -u containerd --no-pager -n 20
+./scripts/recover_registry_ca.sh
 ```
 
-`make preflight` exists to separate two failures that look identical from a pull:
-**the registry is down**, and **the registry is serving a different certificate
-than the one on disk**. The second is caused by re-minting certificates while the
-registry was running (D7), and its only symptom is `unknown authority` — which
-reads like a CA problem rather than a lifecycle-coupling one.
+It cannot recover `ca.key` — nodes hold only the public `ca.crt`. Regenerating instead would rotate the CA out from under the running nodes, which is the orphaned-anchor problem wearing a different hat.
 
 ---
 
-## 9. Full defect list
+## **12. Where things are**
 
-| # | defect | state |
-|---|---|---|
-| **D1** | Registry healthcheck used `curl`, which `registry:2` does not have — the container was permanently `unhealthy`, masked because the UI used `service_started` | **fixed upstream** (`wget`) |
-| **D2** | `pkill -HUP containerd` is a kill, not a reload; ~7 s with no runtime on every node, reported as `✓` | open |
-| **D3** | Every step of the injection loop is failure-guarded; success is echoed unconditionally — the loop cannot fail | open |
-| **D4** | `ca_file` and `skip_verify = true` contradict each other; the CA is never actually verified | open |
-| **D5** | `make vault-secret` creates the Secret in `core`; every service Deployment is in `admin` and mounts it — namespace-scoped, so the mount can never resolve and pods hang in `ContainerCreating` | open |
-| **D6** | `README.md` documents a different mechanism than the code: wrong node names, **wrong certs.d path (`localhost` vs `host.docker.internal`)**, no `hosts.toml`, no `config_path`, SIGHUP described as a reload, and manifests shown with an `https://` prefix that the API server rejects | open |
-| **D7** | `make down` deletes `data/registry/`, destroying the CA **private key** while nodes keep the old CA — and `make run` re-mints certs without re-patching nodes, so every pull then fails with `unknown authority` | open |
-| **D8** | The docker daemon's trust store is never populated, so the first `docker push` in a fresh checkout fails on TLS | open |
+![Diagram 04: Repository Layout & Artifacts](diagrams/04-repo-layout.svg)
 
-### D6 in detail — the docs contradict the code
-
-| `README.md` says | the code does |
-|---|---|
-| nodes are `worker-1, worker-2, worker-3` | `vcluster.cp.<name>`, `vcluster.node.<name>.worker-{1,2,3}` |
-| certs.d path is **`localhost:5001`** | **`host.docker.internal:5001`** |
-| no `hosts.toml` copied | copies it |
-| no `config_path` set | sets it |
-| "SIGHUP reloads containerd without restarting the node" | it kills it (D2) |
-| "Idempotent: safe to re-run on every `make k8s`" | each run kills containerd again |
-| healthcheck `curl -kfsS …` | `wget …` (D1) |
-| `image: https://host.docker.internal:5001/…:0.1` | `host.docker.internal:5001/…:0.6` — **zero** with a scheme, across all four cores |
-
-### D7 in detail — the teardown that orphans the trust anchor
-
+```bash
+make help     # every target
+make status   # where everything currently stands
 ```
-   make down  →  rm -rf ./data/registry
-                     │
-                     └─► contains certs/ca.key
-                          THE ONLY COPY IN EXISTENCE
-                          nodes hold only the public ca.crt
-
-   next `make run`   → mints a BRAND NEW CA
-                      → registry serves the new certificate
-                      → but make run does NOT re-patch the nodes
-                        (only `make k8s` step 2 does, and it is not in `make run`)
-
-   result:  stack reports healthy
-            cluster cannot pull a single image
-            symptom: "certificate signed by unknown authority"
-            — which reads like a CA problem
-```
-
-`scripts/recover_registry_ca.sh` exists precisely to copy the CA back out of a
-node, and documents that the private key is unrecoverable. That is a workaround
-for an ordering defect, not a fix.
 
 ---
-
-## 10. What we recommend
-
-In priority order. The first three are small and each removes a whole class of
-confusion.
-
-1. **Rewrite `README.md`'s registry section from the Makefile.** It currently
-   teaches a certs.d path that cannot work (D6). Documentation that contradicts
-   the code is worse than none when the code's own output is unfalsifiable (D3).
-
-2. **Extract `scripts/patch_registry_ca.sh` and call it from the Makefile.** The
-   mechanism most worth testing is the part with no seam — five chained
-   `docker cp`/`exec` steps in a make recipe. A script is the *precondition* for
-   testing it.
-
-3. **Make that script verify, then exit non-zero.** Read `ca.crt`, `hosts.toml`
-   and `config_path` back out of each node, and assert the certs.d directory name
-   matches the authority the manifests actually use. That single check closes D3
-   and the entire authority-mismatch family.
-
-4. **Add `make registry-daemon-ca`** to populate the docker daemon's trust store
-   (D8), so the push path stops depending on manual setup.
-
-5. **Replace `pkill -HUP containerd` with `systemctl restart containerd`**, and
-   correct the comments that describe it as a reload (D2). Measured: the restart
-   is survivable, the SIGHUP is not. Then wait for
-   `systemctl is-active containerd` before printing `✓`.
-
-6. **Decide what `skip_verify` should be (D4).** Either set it `false` and accept
-   that a stale CA now fails loudly — the correct choice, and it makes
-   `preflight` and the pull agree — or keep `true` and document explicitly that
-   the CA is best-effort and `preflight` is the only check. What is not
-   defensible is shipping `ca_file` and `skip_verify = true` in the same file
-   with nothing reconciling them.
-
-7. **Derive the authority once.** Five occurrences of
-   `host.docker.internal:5001` across three files, unvalidated. A single
-   `REGISTRY_AUTHORITY` feeding the SAN list, the certs.d path, `hosts.toml` and
-   the manifest renderer makes the mismatch family structurally impossible.
-
-8. **Move `make vault-secret` to the namespaces that consume it** (D5), or create
-   it in each.
-
-9. **Stop `rm -rf ./data/registry` in `make down`** (D7), or preserve
-   `certs/ca.key` and wipe only the leaf. `scripts/purge_registry.sh --full`
-   already preserves `certs/`; `make down` should use the same discipline.
-
-10. **Reconsider the 2-day leaf, or re-patch nodes from `make run`.** Either
-    removes the D7 window. The current design ties trust state to a directory
-    that `make down` deletes, on a 2-day clock.
-
----
-
-## Where things are
-
-```
-  Makefile                          orchestration; every target idempotent
-  docker-compose.yml                registry + UI, extracted, renames applied
-  .env                              verbatim from the source
-  vcluster1.yml                     verbatim — node topology and volumes
-  scripts/
-    containerd-hosts.toml           verbatim, 75 bytes, no trailing newline
-    purge_registry.sh               verbatim — preserves certs/ across a wipe
-    recover_registry_ca.sh          verbatim — the ca.key-is-unrecoverable warning
-  k8s/
-    1.01.nginx-pull-test.yaml       the only added file — the pull test
-  docs/
-    9.Registry_TLS.md               source-ready reference, for deploy/docs/
-  verify-extract.sh                 mechanical proof the extraction is intact
-  data/                             generated; never committed (CA private key)
-```
-
-`docs/9.Registry_TLS.md` is written for the source project — it uses the
-source's own resource names and file paths, and follows the numbering of
-`deploy/docs/`. It is the document to push back into the source alongside the
-`README.md` corrections in §10.1.
+*End of Document*

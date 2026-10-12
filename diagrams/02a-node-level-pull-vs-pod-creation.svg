@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg2a" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b1329" />
+      <stop offset="100%" stop-color="#1d2a44" />
+    </linearGradient>
+  </defs>
+
+  <rect width="960" height="420" fill="url(#bg2a)" rx="16" />
+
+  <!-- Outer Boundary -->
+  <rect x="30" y="25" width="900" height="370" rx="12" fill="none" stroke="#38bdf8" stroke-width="2" stroke-dasharray="4,4" />
+  <text x="50" y="52" fill="#38bdf8" font-family="sans-serif" font-size="15" font-weight="bold">KUBERNETES WORKER NODE CONTAINER</text>
+
+  <!-- Step 1: Kubelet -->
+  <rect x="50" y="85" width="200" height="110" rx="8" fill="#1e293b" stroke="#64748b" stroke-width="1.5" />
+  <text x="65" y="115" fill="#f8fafc" font-family="sans-serif" font-size="14" font-weight="bold">1. Kubelet</text>
+  <text x="65" y="140" fill="#94a3b8" font-family="sans-serif" font-size="11">Requests image pull</text>
+  <text x="65" y="160" fill="#38bdf8" font-family="sans-serif" font-size="11" font-weight="bold">Triggers CRI Call</text>
+
+  <!-- Connector 1 -> 2 -->
+  <path d="M 250 140 L 280 140" stroke="#f8fafc" stroke-width="2" />
+
+  <!-- Step 2: containerd -->
+  <rect x="280" y="85" width="220" height="110" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" />
+  <text x="295" y="115" fill="#f59e0b" font-family="sans-serif" font-size="14" font-weight="bold">2. containerd</text>
+  <text x="295" y="140" fill="#94a3b8" font-family="sans-serif" font-size="11">Executes HTTPS pull</text>
+  <text x="295" y="160" fill="#fbbf24" font-family="monospace" font-size="10">Needs local CA match</text>
+
+  <!-- Connector 2 -> Trust Store -->
+  <path d="M 390 195 L 390 230" stroke="#f59e0b" stroke-width="2" stroke-dasharray="4,4" />
+
+  <!-- Trust Store Box -->
+  <rect x="250" y="230" width="280" height="130" rx="8" fill="#0f172a" stroke="#10b981" stroke-width="2" />
+  <text x="265" y="258" fill="#10b981" font-family="sans-serif" font-size="13" font-weight="bold">Node Trust Store Inspection</text>
+  <text x="265" y="283" fill="#e2e8f0" font-family="monospace" font-size="10">/etc/containerd/certs.d/</text>
+  <text x="280" y="303" fill="#34d399" font-family="monospace" font-size="10">└── host.docker.internal:5001/</text>
+  <text x="295" y="323" fill="#34d399" font-family="monospace" font-size="10">├── ca.crt &amp; hosts.toml</text>
+
+  <!-- Connector 2 -> Step 3 -->
+  <path d="M 500 140 L 540 140" stroke="#10b981" stroke-width="2" />
+
+  <!-- Step 3: Pod Creation -->
+  <rect x="540" y="85" width="370" height="275" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="2" />
+  <text x="560" y="120" fill="#a7f3d0" font-family="sans-serif" font-size="15" font-weight="bold">3. Pod Creation</text>
+  <text x="560" y="150" fill="#ecfdf5" font-family="sans-serif" font-size="12">Pod created ONLY AFTER pull completes</text>
+  <text x="560" y="170" fill="#ecfdf5" font-family="sans-serif" font-size="12">successfully over TLS.</text>
+  
+  <rect x="560" y="200" width="330" height="135" rx="6" fill="#047857" />
+  <text x="575" y="230" fill="#ffffff" font-family="sans-serif" font-size="13" font-weight="bold">Application Container Running</text>
+  <text x="575" y="255" fill="#a7f3d0" font-family="sans-serif" font-size="11">Workload active on worker node</text>
+  <text x="575" y="280" fill="#a7f3d0" font-family="monospace" font-size="10">image: host.docker.internal:5001/...</text>
+</svg>
