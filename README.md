@@ -1,9 +1,14 @@
 # **Local TLS registry + vCluster: getting a node to pull from a registry it doesn't trust**
 
-## **What this is**
+**The What**
 
-A self-contained lab that demonstrates one mechanism, end to end:
-A container registry with a certificate we generated ourselves, serving an image that a Kubernetes node we never configured by any supported means pulls over HTTPS — and runs.
+A self-contained lab that demonstrates one mechanism, end to end: A container registry with a self signed certificate we generated, serving an container image that a Kubernetes node we configured pulls over HTTPS — and runs.
+
+Kubernetes by default wants to only pull images from Registries that it trusts, i.e. and in our world that implies it is done using a url based on https, https://<hostname>. It’s all about that little **“s”** after [https](https://en.wikipedia.org/wiki/HTTPS), as the **“s”** first means it is secure, it’s encrypted. 
+
+Going to keep this very high level, as we’re not doing a paper about the encryption, but rather how it impacts us. At the simplest level, trust is established using a [public/private](https://en.wikipedia.org/wiki/Public-key_cryptography) key pair bound to the registry's hostname. Once that trust is verified, a secret session key is generated to encrypt the actual data transfer.
+
+In simple terms: The registry holds a private key and a public certificate bound to its hostname. During the HTTPS handshake, the registry proves its identity using its private key, and your Kubernetes node verifies that identity using the certificate. Once trusted, they establish a secret shared key to encrypt the image download, ensuring nobody can intercept or modify it in transit.
 
 ![Diagram 01: System Architecture Overview](diagrams/01-system-architecture-overview.svg)
 
@@ -15,45 +20,51 @@ make run && make pull && make build && make k8s && make app
 
 That is the whole cycle. §8 walks through it line by line, including the teardown.
 
-## Overview - First... 
+That is the whole cycle. §8 walks through it line by line, including the teardown.
 
-**The What**
 
-Little deeper. Regarding our local stack. It all starts as a local Docker engine, onto which we then deploy [vCluster](https://www.vcluster.com) which in turn host our Kubernetes environment, also known as VIND (vCluster in Docker). 
+Let’s unpack the above a little deeper. Which will quickly bring the problem into view.
 
-At this point the vCluster container images etc run on our local [Docker](https://www.docker.com) engine. 
+First our local stack. It all starts as a local Docker engine, onto which we then deploy [vCluster](https://www.vcluster.com) which in turn hosts our Kubernetes environment, also known as VIND (vCluster in Docker).
+
+At this point the vCluster container images etc run on our local [Docker](https://www.docker.com) engine.
 
 All images used to deploy our environment are sourced from the local [Docker Container Registry](https://www.docker.com/products/docker-hub/). Life is still good and simple at this point.
 
-We now create our project deployment Manifest files. These follow the structure of: `image: <Source/imageName:tag>`.
+We now create our project deployment Manifest files. These follow the structure of: image: <source/imageName:tag>.
 
-First option, and easiest, simply pull (reference) public registries directly. But this starts becoming a pain when during a high cadence development cycle you compile/build/verify/fix/repeat.
+First option, and easiest, simply pull (reference) public registries directly. But this starts becoming a pain when during development where you might have a high cadence of  compile/build/verify/fix/repeat.
 
-So this works, if you don't deploy/redeploy allot, this works, if your security department does not force a local verified container registry.
+So this works, if you don't deploy/redeploy a lot, this works, if your security department does not force a local verified container registry. The world is not that nice though. Life’s not that easy.
 
-So what now... ok, so we execute `pull <source/imageName:tag` pulling the container images into our local Docker Registry and we recode the manifest files, pointing them locally.
+So what now... ok, we will rather use pull <source/imageName:tag> from a public registry, but now storing container images in our local Docker Registry and we then re-code the manifest files, deploying the images from our local registry.
 
-And here is where life gets interesting. When we now try and point to the Docker registry in the Manifest files things fall apart. We get can't find the images. To remedy this we copy the container images onto each Kubernetes node prior to the manifest file being applied. All's working again.
+And now life gets interesting. When we now try to use our Docker registry in the manifest files as the source for the image tag things fall apart. We get an error: can't find the images. Easiest way to resolve this, we copy (load) the container images onto each Kubernetes node prior to the manifest file being applied. All's working again. 
 
-But, if this is 5 images, no worries, but it quickly becomes a pain when your project is 30 images, that you recompile and rebuild in a cycle, each time requiring you to re-copy them back onto your Kubernetes nodes before being able to deploy.
+If this is 5 images, deployed once, no worries, but it quickly becomes a pain again when your project is lets say 30 images, you lucky if they < 100MB, but life deals you a nasty and they like 500MB-1GB, which you compile, rebuild container image, and each time you’re required to re-copy them back onto your Kubernetes nodes before being able to deploy. This you don’t want. (I’m not even going to bother to even show this copy/load command, it’s just a bad idea).
 
-This is the **what we fix** below.
+This is the problem, this is what we fix below.
 
-**Now: The How**
+Now: The How
 
-Our solution, We host a registry on Docker Compose](https://docs.docker.com/compose/) ontop of our [Docker Engine](https://www.docker.com) and we then reference that URL endpoint as container source. 
+Our solution, We host our own registry, as a shared service on our (Docker Compose](https://docs.docker.com/compose/) deployment and we then reference that URL endpoint as a container registry.
 
-Why [Docker Compose](https://docs.docker.com/compose/) you ask, well to simulate a larger "corporate" environment we might already be simulating various shared services like a Kafka cluster, a Hashicorp Vault, or (...). The registry simply becomes another shared service, that we want to provide, that does not belong to the consumer in this case, being the application being deployed on the Kubernetes cluster.
+Why [Docker Compose](https://docs.docker.com/compose/) you ask, well to simulate a larger "corporate" environment we might already be simulating various other shared services like a Kafka cluster, a Hashicorp Vault, or (...). The registry simply becomes another shared service, that we want to provide, that does not belong to the project. In this case, the project is what we’re deploying onto the project Kubernetes cluster. Everything else is common shared corporate services and this is where the registry will normally live.
 
-Things are never just easy... Because all of this is local, the Kubernetes cluster, or make that the containerd processes specifically (and our world of we dont trust anything anymore) want the source images to be signed. So we have to do a little work around, in a production space your registry would have a registered host name with a registered certificate.
+But, things are never just easy... Because of all of this “local Kubernetes cluster” and local “registry” on a Docker Compose, we run into our next little pebble, or boulder in the road. Kubernetes or make that the containerd process specifically (and our world of, we don’t trust anything anymore) “containerd” wants the source from the registry using https.
+ 
+And that's the entire build below, our little work around. In a production space your registry would have a registered host name with a registered certificate, in our lab, we’re going to create a self signed certificate and load it into “containerd”, making it trust our “registry” service.
+What we end with is a set of correctly structured manifest files, using the right protocol, reference a real registry, not executing that nasty copy “fix” as per above, other worlds, more representative of the real world.
+
 
 ## **1. The situation**
 
-The registry uses a **self-signed certificate** we generate ourselves. It is not issued by a public CA and never will be — it serves on localhost behind the Docker VM gateway, so there is nothing to issue it from.
+The registry uses a self-signed certificate we generate ourselves. It is not issued by a public CA (Certificate Authority) and never will be — it serves on localhost behind the Docker VM gateway, so there is nothing to issue it from.
 
 The consequence: every image pull is an HTTPS connection to a server whose certificate nothing trusts by default. Before a single application container can start, that trust has to be established on every node.
 
 That is the whole problem. Everything below is about how it is solved, and where the solving is fragile.
+
 
 ## **2. What "a CA cert for k8s" actually means**
 
