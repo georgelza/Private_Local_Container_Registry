@@ -270,6 +270,8 @@ That failure persisted even *with* the CA correctly installed, because Docker De
 
 **The asymmetry worth remembering:** the *push* can go unverified and nobody notices; the *pull* never can. containerd has no loopback exemption, and it dials the gateway name regardless. Every trust failure this lab has ever shown upstream of the image pull, not the push.
 
+This does have the benefit that we can bring up the Docker Compose Stack, and push all our infrastructure images into it, having them then ready when we deploy the k8s side and need to pull during the manifest deployment.
+
 ![Diagram 07c: Push Verification Asymmetry](diagrams/07c-push-verification-asymmetry.svg)
 
 ### The check that catches all of it
