@@ -305,6 +305,9 @@ ERROR: a node does not trust the current CA — run: make patch-nodes
 
 ## **8. Seeing it work**
 
+All the code and diagrams for this Blog can be @ [Private Local Container Registry](https://github.com/georgelza/Private_Local_Container_Registry.git) 
+*(and yes some AI was used to assist during the lab… it’s a tool, why not benefit from it).*
+
 ![Diagram 07a: Certificate Chain of Custody](diagrams/07a-certificate-chain-of-custody.svg)
 
 | Component | Endpoint |
