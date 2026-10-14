@@ -174,11 +174,10 @@ Makefile:65: *** HOST_PORT_REGISTRY is not set in .env — the registry authorit
 
 The story is above. This is the machinery.
 
-### Chain of custody
 
 ![Diagram 06a: Chain of Custody](diagrams/06a-chain-of-custody.svg)
 
-### What `certs/` holds
+
 
 ![Diagram 06b: What certs/ Holds](diagrams/06b-certs-directory.svg)
 
@@ -262,9 +261,38 @@ installs it for the daemon. Two consequences worth stating plainly:
 
 We assumed the docker daemon needed the CA installed, because `curl --cacert` and the daemon are different trust paths and only the first is under our control. **It didn't need it.** `docker info` reports:
 
+```bash
+docker info | grep -A4 'Insecure Registries'
+ Insecure Registries:
+  hubproxy.docker.internal:5555
+  127.0.0.0/8
+  ::1/128
+ Live Restore Enabled: false
+```
+
 Loopback is exempt, so the daemon skips verification for `localhost:5001` outright. Measured, with the CA files deleted:
 
+```bash
+docker push localhost:5001/probe-full:latest
+The push refers to repository [localhost:5001/probe-full]
+1b349a333453: Preparing
+1b349a333453: Mounted from probe-a
+latest: digest: sha256:f02d5b945a633e96243d5b7ddb53c28952b672794b8915b2b5d6b2a5294264e2 size: 527
+
+$ curl https://localhost:5001/v2/_catalog
+curl: (60) SSL certificate problem: unable to get local issuer certificate
+```
+
 Same endpoint, same moment. One verifies; the other does not. And the exemption is **loopback-specific** — pushing via the gateway name does verify:
+
+```bash
+docker push host.docker.internal:5001/probe-gw:latest
+The push refers to repository [host.docker.internal:5001/probe-gw]
+Get "https://host.docker.internal:5001/v2/": tls: failed to verify certificate:
+  x509: certificate signed by unknown authority
+  (possibly because of "crypto/rsa: verification error" while trying to verify
+   candidate authority certificate "Local Registry CA")
+```
 
 That failure persisted even *with* the CA correctly installed, because Docker Desktop does not read `~/.docker/certs.d/` until it is restarted. So the install in `make build` is belt-and-braces: it buys you the ability to push via the gateway name, on a daemon that has been restarted. We push via loopback, so the lab never depends on it.
 
